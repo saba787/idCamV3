@@ -18,6 +18,7 @@ from idcam.config.schema import AppConfig
 from idcam.exceptions import (
     AutofocusError,
     CameraError,
+    CameraUnavailableError,
     CaptureError,
     ImageValidationError,
     NetworkError,
@@ -26,7 +27,6 @@ from idcam.exceptions import (
     ServerRejectedError,
     ServerError,
     ShutdownRequested,
-    StorageError,
 )
 from idcam.logging.setup import get_logger, set_log_context
 from idcam.network.api_client import ApiClient
@@ -40,6 +40,19 @@ from idcam.vision.document_detector import DocumentDetector, DocumentPresence
 from idcam.vision.stability_detector import StabilityDetector
 
 logger = get_logger("orchestrator")
+
+# States that run a single long-lived action per state entry (no re-entry per loop tick).
+ONE_SHOT_STATES = frozenset({
+    AppState.DOCUMENT_DETECTED,
+    AppState.FOCUSING,
+    AppState.FOCUS_VERIFICATION,
+    AppState.CAPTURING,
+    AppState.IMAGE_VALIDATION,
+    AppState.UPLOADING,
+    AppState.WAITING_FOR_SERVER,
+    AppState.PROCESSING_RESPONSE,
+    AppState.SUCCESS,
+})
 
 
 class ApplicationOrchestrator:
@@ -68,15 +81,19 @@ class ApplicationOrchestrator:
         self._shutdown_event = asyncio.Event()
         self._transaction: ActiveCaptureTransaction | None = None
         self._recovery_attempts = 0
+        self._next_recovery_at: float = 0.0
+        self._recovery_in_progress = False
         self._removal_count = 0
-        self._focus_verify_attempts = 0
         self._state_tick_running = False
+        self._state_action_claimed: AppState | None = None
+        self._error_backoff_claimed = False
         self._capture_path: Path | None = None
         self._pending_response = None
 
     @property
     def has_active_transaction(self) -> bool:
-        return self._transaction is not None and not self._transaction.is_terminal
+        """True when the state machine is in any transactional state."""
+        return self.sm.in_transaction()
 
     async def run(self) -> int:
         self._install_signal_handlers()
@@ -130,7 +147,18 @@ class ApplicationOrchestrator:
         )
 
         self._transition(AppState.CAMERA_INITIALIZING)
-        await asyncio.to_thread(self.camera.initialize)
+        try:
+            await asyncio.to_thread(self.camera.initialize)
+        except CameraUnavailableError as exc:
+            logger.error("event=camera_init_failed %s", exc)
+            self.health.camera = ComponentStatus(
+                level=HealthLevel.UNAVAILABLE,
+                message=str(exc),
+                details={"healthy": False},
+            )
+            self._transition(AppState.RECOVERY, reason="camera_init_failed")
+            return
+
         caps = self.autofocus.probe_capabilities(self.camera)
         self.health.autofocus_available = caps.hardware_af_available
         self.health.autofocus_degraded = caps.degraded
@@ -183,6 +211,7 @@ class ApplicationOrchestrator:
             self._transaction.capture_id if self._transaction else None,
         )
         if state == AppState.DOCUMENT_DETECTED:
+            self._abort_transaction("document_detected_timeout")
             self._transition(AppState.IDLE, reason="document_detected_timeout")
             return True
         if state == AppState.WAITING_FOR_STABILITY:
@@ -204,6 +233,15 @@ class ApplicationOrchestrator:
             await self._fail_transaction_and_wait("image_invalid", "Image validation timed out")
             return True
         return False
+
+    def _claim_state_action(self) -> bool:
+        """Return True if this tick may run the state's action (one-shot per entry)."""
+        if self.sm.state not in ONE_SHOT_STATES:
+            return True
+        if self._state_action_claimed == self.sm.state:
+            return False
+        self._state_action_claimed = self.sm.state
+        return True
 
     async def _dispatch_state_tick(self) -> None:
         if self._state_tick_running:
@@ -232,13 +270,34 @@ class ApplicationOrchestrator:
         finally:
             self._state_tick_running = False
 
+    async def _safe_preview(self):
+        try:
+            return await asyncio.to_thread(self.camera.capture_preview_array)
+        except CameraError as exc:
+            logger.error("event=camera_preview_failed %s", exc)
+            await self._enter_recovery(str(exc))
+            return None
+
+    async def _check_motion_abort(self) -> bool:
+        """Return False if document moved and transaction was failed."""
+        frame = await self._safe_preview()
+        if frame is None:
+            return False
+        if self.detector.classify(frame) == DocumentPresence.DOCUMENT_MOVING:
+            logger.warning("event=document_moved_during_capture_phase state=%s", self.sm.state.value)
+            await self._fail_transaction_and_wait("stability_timeout", "Document moved during capture")
+            return False
+        return True
+
     async def _idle_tick(self) -> None:
         if self.has_active_transaction:
             return
         if not self.disk.can_capture(self.config.storage.capture_reserve_mb):
             self._update_storage_health(self.disk.check())
             return
-        frame = await asyncio.to_thread(self.camera.capture_preview_array)
+        frame = await self._safe_preview()
+        if frame is None:
+            return
         if self.detector.detect(frame):
             logger.info("event=document_detected")
             self.stability.reset()
@@ -251,17 +310,20 @@ class ApplicationOrchestrator:
         txn = ActiveCaptureTransaction(capture_id=ActiveCaptureTransaction.generate_id())
         txn.mark_document_detected()
         self._transaction = txn
-        self._focus_verify_attempts = 0
         self._capture_path = None
         set_log_context(capture_id=txn.capture_id)
         logger.info("event=transaction_started capture_id=%s", txn.capture_id)
         return txn
 
     async def _document_detected_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         self._transition(AppState.WAITING_FOR_STABILITY)
 
     async def _stability_tick(self) -> None:
-        frame = await asyncio.to_thread(self.camera.capture_preview_array)
+        frame = await self._safe_preview()
+        if frame is None:
+            return
         presence = self.detector.classify(frame)
         if presence == DocumentPresence.DOCUMENT_MOVING:
             self.stability.reset()
@@ -276,8 +338,12 @@ class ApplicationOrchestrator:
             self.sm.touch_progress()
 
     async def _focusing_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         assert self._transaction is not None
         if self._shutdown_event.is_set():
+            return
+        if not await self._check_motion_abort():
             return
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
@@ -296,7 +362,11 @@ class ApplicationOrchestrator:
             await self._fail_transaction_and_wait("focus_failed", str(exc))
 
     async def _focus_verification_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         assert self._transaction is not None
+        if not await self._check_motion_abort():
+            return
         min_sharp = self.config.quality.min_sharpness * 0.6
         self._transaction.focus_verify_attempts += 1
         try:
@@ -315,7 +385,11 @@ class ApplicationOrchestrator:
                 await self._fail_transaction_and_wait("focus_failed", "Focus verification failed")
 
     async def _capturing_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         assert self._transaction is not None
+        if not await self._check_motion_abort():
+            return
         if not self.disk.can_capture(self.config.storage.capture_reserve_mb):
             await self._fail_transaction_and_wait("storage_full", "Insufficient disk space")
             return
@@ -331,6 +405,8 @@ class ApplicationOrchestrator:
             await self._enter_recovery(str(exc))
 
     async def _validation_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         assert self._transaction is not None
         assert self._capture_path is not None
         try:
@@ -355,6 +431,8 @@ class ApplicationOrchestrator:
             await self._fail_transaction_and_wait("image_invalid", str(exc))
 
     async def _uploading_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         assert self._transaction is not None
         assert self._capture_path is not None
         self._transaction.mark_upload_started()
@@ -378,9 +456,13 @@ class ApplicationOrchestrator:
             await self._fail_transaction_and_wait("upload_failed", str(exc))
 
     async def _waiting_server_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         self._transition(AppState.PROCESSING_RESPONSE)
 
     async def _processing_response_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         assert self._transaction is not None
         response = self._pending_response
         if response and response.success and response.outcome == UploadOutcome.ACCEPTED:
@@ -399,12 +481,16 @@ class ApplicationOrchestrator:
             await self._fail_transaction_and_wait(failure_key, msg or "Upload failed")
 
     async def _success_tick(self) -> None:
+        if not self._claim_state_action():
+            return
         await asyncio.sleep(2.0)
         self._removal_count = 0
         self._transition(AppState.WAITING_FOR_REMOVAL)
 
     async def _removal_tick(self) -> None:
-        frame = await asyncio.to_thread(self.camera.capture_preview_array)
+        frame = await self._safe_preview()
+        if frame is None:
+            return
         if self.detector.is_scene_empty(frame):
             self._removal_count += 1
         else:
@@ -422,24 +508,33 @@ class ApplicationOrchestrator:
             self._transition(AppState.IDLE)
 
     async def _recovery_tick(self) -> None:
-        self._recovery_attempts += 1
+        if self._recovery_in_progress:
+            return
+        if time.monotonic() < self._next_recovery_at:
+            return
+        if not self._claim_state_action():
+            return
+
+        self._recovery_in_progress = True
         max_attempts = self.config.camera.recovery_max_attempts
-        if self._recovery_attempts > max_attempts:
-            logger.error("Recovery exhausted after %d attempts", max_attempts)
-            self.health.record_failure("recovery_exhausted")
-            self.health.camera = ComponentStatus(level=HealthLevel.UNAVAILABLE, message="Camera recovery exhausted")
-            self._transition(AppState.ERROR)
-            raise RecoveryExhaustedError("Recovery attempts exhausted")
-
-        logger.info("event=recovery_started attempt=%d/%d", self._recovery_attempts, max_attempts)
-        self.health.record_recovery()
-        self._clear_transaction()
-
         try:
+            if self._recovery_attempts >= max_attempts:
+                logger.error("Recovery exhausted after %d attempts", max_attempts)
+                self.health.record_failure("recovery_exhausted")
+                self.health.camera = ComponentStatus(level=HealthLevel.UNAVAILABLE, message="Camera recovery exhausted")
+                self._transition(AppState.ERROR)
+                raise RecoveryExhaustedError("Recovery attempts exhausted")
+
+            self._recovery_attempts += 1
+            logger.info("event=recovery_started attempt=%d/%d", self._recovery_attempts, max_attempts)
+            self.health.record_recovery()
+            self._abort_transaction("recovery")
+
             await asyncio.sleep(self.config.camera.recovery_delay_sec)
             await asyncio.to_thread(self.camera.restart)
             self.health.camera = ComponentStatus(level=HealthLevel.HEALTHY, details={"healthy": True})
             self._recovery_attempts = 0
+            self._next_recovery_at = 0.0
             if self.disk.check().healthy:
                 self._transition(AppState.IDLE)
             else:
@@ -447,24 +542,46 @@ class ApplicationOrchestrator:
         except CameraError as exc:
             logger.error("event=recovery_failed %s", exc)
             self.health.camera = ComponentStatus(level=HealthLevel.UNAVAILABLE, message=str(exc))
+            self._next_recovery_at = time.monotonic() + self.config.camera.recovery_delay_sec
+            self._state_action_claimed = None
+        finally:
+            self._recovery_in_progress = False
 
     async def _error_tick(self) -> None:
         storage = self.disk.check()
         self._update_storage_health(storage)
-        if storage.healthy and not self._shutdown_event.is_set():
+        if not storage.healthy or self._shutdown_event.is_set():
+            return
+        if self._error_backoff_claimed:
+            return
+        self._error_backoff_claimed = True
+        try:
             await asyncio.sleep(10.0)
             if not self._shutdown_event.is_set():
                 self._transition(AppState.RECOVERY, reason="auto_recovery_from_error")
+        finally:
+            self._error_backoff_claimed = False
 
     async def _handle_watchdog(self, alert) -> None:
         await self._enter_recovery(f"watchdog:{alert.reason}")
 
     async def _enter_recovery(self, reason: str) -> None:
-        logger.warning("event=enter_recovery reason=%s capture_id=%s", reason, getattr(self._transaction, "capture_id", None))
+        logger.warning(
+            "event=enter_recovery reason=%s capture_id=%s",
+            reason,
+            getattr(self._transaction, "capture_id", None),
+        )
         self._cleanup_transaction_files()
         if self._transaction and not self._transaction.is_terminal:
             self._transaction.mark_failed(reason)
+        self._next_recovery_at = 0.0
+        self._state_action_claimed = None
         self._transition(AppState.RECOVERY, reason=reason)
+
+    def _abort_transaction(self, reason: str) -> None:
+        if self._transaction and not self._transaction.is_terminal:
+            self._transaction.mark_failed(reason)
+        self._cleanup_transaction_files()
 
     async def _fail_transaction_and_wait(self, failure_key: str, detail: str) -> None:
         if self._transaction:
@@ -491,7 +608,6 @@ class ApplicationOrchestrator:
         self._transaction = None
         self._capture_path = None
         self._pending_response = None
-        self._focus_verify_attempts = 0
         set_log_context(capture_id=None)
 
     def _refresh_health(self) -> None:
@@ -525,6 +641,9 @@ class ApplicationOrchestrator:
             target = AppState.SHUTDOWN
         prev = self.sm.state
         self.sm.transition(target, reason=reason)
+        self._state_action_claimed = None
+        if target != AppState.ERROR:
+            self._error_backoff_claimed = False
         set_log_context(state=target.value)
         logger.info(
             "event=state_transition from=%s to=%s reason=%s capture_id=%s",

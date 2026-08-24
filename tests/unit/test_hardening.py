@@ -201,6 +201,7 @@ class TestOrchestratorGuards:
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
         assert orch.has_active_transaction
         assert orch.sm.in_transaction()
+        assert orch.sm.in_transaction()
 
     @pytest.mark.asyncio
     async def test_startup_cleans_stale_temps(self, app_config, tmp_path):

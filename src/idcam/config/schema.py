@@ -7,6 +7,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
+# First-install production template values. These are always rejected so the
+# service cannot look "ready" while still pointing at a placeholder endpoint.
+PLACEHOLDER_DEVICE_IDS = frozenset({"change_me", "changeme", "replace_me", "todo"})
+PLACEHOLDER_SERVER_HOSTS = frozenset({"unconfigured.invalid"})
+EXAMPLE_SERVER_HOSTS = frozenset({"example.com", "api.example.com"})
+
 
 class ServerConfig(BaseModel):
     url: HttpUrl
@@ -22,6 +28,17 @@ class ServerConfig(BaseModel):
     def normalize_path(cls, value: str) -> str:
         if not value.startswith("/"):
             return f"/{value}"
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def reject_placeholder_url(cls, value: HttpUrl) -> HttpUrl:
+        host = (value.host or "").lower().rstrip(".")
+        if host in PLACEHOLDER_SERVER_HOSTS:
+            raise ValueError(
+                "server.url is not configured. Set the real HTTPS API URL in "
+                "/etc/idcam/config.yaml or IDCAM_SERVER_URL."
+            )
         return value
 
 
@@ -170,4 +187,10 @@ class AppConfig(BaseModel):
         stripped = value.strip()
         if not stripped:
             raise ValueError("device_id cannot be empty")
+        normalized = stripped.lower().replace("-", "_")
+        if normalized in PLACEHOLDER_DEVICE_IDS:
+            raise ValueError(
+                "device_id is not configured. Set a unique device identifier in "
+                "/etc/idcam/config.yaml or IDCAM_DEVICE_ID."
+            )
         return stripped

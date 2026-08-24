@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from idcam.app.state_machine import AppState
+from idcam.storage.paths import ensure_writable_directory
 from idcam.ui.messages import FAILURE_MESSAGES, USER_MESSAGES
 
 
@@ -73,7 +74,7 @@ class StatusPublisher:
         self.status_file = status_file
         self.version = version
         self._snapshot = StatusSnapshot(state=AppState.BOOT.value, message=USER_MESSAGES[AppState.BOOT])
-        self.status_file.parent.mkdir(parents=True, exist_ok=True)
+        ensure_writable_directory(self.status_file.parent, "runtime status")
 
     @property
     def snapshot(self) -> StatusSnapshot:

@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from idcam.logging.setup import get_logger
+from idcam.storage.paths import ensure_writable_directory
 
 logger = get_logger("storage.temp_files")
 
@@ -21,7 +22,7 @@ class TempFileStore:
 
     def __init__(self, base_dir: Path) -> None:
         self.base_dir = base_dir
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        ensure_writable_directory(self.base_dir, "temp")
         self._apply_dir_permissions()
 
     def _apply_dir_permissions(self) -> None:

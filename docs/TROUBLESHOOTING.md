@@ -93,7 +93,28 @@ After success, system waits in `WAITING_FOR_REMOVAL` until scene returns to base
 
 ```bash
 systemctl status idcam
-/opt/idcam/venv/bin/idcam --config /etc/idcam/config.yaml  # run manually
+journalctl -u idcam -e
+/opt/idcam/venv/bin/idcam --config /etc/idcam/config.yaml  # run manually (as user idcam)
 ```
 
 Check StartLimit: `systemctl reset-failed idcam`
+
+Configuration errors exit with code **2** and systemd will not restart-loop them.
+Edit `/etc/idcam/config.yaml` and `/etc/idcam/environment`, then `sudo systemctl start idcam`.
+
+### Permission denied on /var/log/idcam, /var/lib/idcam, or /run/idcam
+
+Do not `mkdir`/`chmod` those paths by hand and do not run the app with sudo.
+
+```bash
+sudo ./scripts/install.sh
+sudo systemctl restart idcam
+```
+
+`/run/idcam` is created by systemd `RuntimeDirectory=idcam` when the unit starts.
+If you ran `idcam` from a login shell as a normal user, that is expected to fail against production paths — use the systemd service.
+
+### First install still using CHANGE_ME / unconfigured.invalid
+
+The service is supposed to refuse to start until `device_id` and `server.url` are real.
+That is not a permissions bug.

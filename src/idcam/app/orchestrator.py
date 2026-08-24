@@ -32,6 +32,7 @@ from idcam.logging.setup import get_logger, set_log_context
 from idcam.network.api_client import ApiClient
 from idcam.network.protocol import UploadOutcome, UploadRequest
 from idcam.storage.disk_monitor import DiskMonitor, StorageHealth
+from idcam.storage.paths import ensure_writable_directory
 from idcam.storage.temp_files import TempFileStore
 from idcam.system.component_health import ComponentStatus, HealthLevel, SystemHealth
 from idcam.system.watchdog import Watchdog
@@ -126,7 +127,7 @@ class ApplicationOrchestrator:
 
     async def _startup(self) -> None:
         self._transition(AppState.INITIALIZING)
-        self.config.temp_dir.mkdir(parents=True, exist_ok=True)
+        ensure_writable_directory(self.config.temp_dir, "temp")
         removed = self.temp_store.cleanup_stale(self.config.storage.stale_temp_max_age_sec)
         if removed:
             logger.info("Startup: removed %d stale temp files", removed)

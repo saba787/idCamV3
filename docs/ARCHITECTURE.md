@@ -206,11 +206,11 @@ Response 4xx/5xx:
 
 YAML at `/etc/idcam/config.yaml` (override via `IDCAM_CONFIG` env).
 
-Validated with Pydantic on startup. Invalid config → ERROR state, exit code 1.
+Validated with Pydantic on startup. Invalid config → process exit code 2 (systemd does not restart-loop).
 
-See `config/config.example.yaml` for full schema.
+See `config.example.yaml` (development) and `deploy/config.yaml.template` (first production install).
 
-Secrets: `auth_token` in config file with `0600` permissions, or `IDCAM_AUTH_TOKEN` env override.
+Secrets: `IDCAM_AUTH_TOKEN` in `/etc/idcam/environment` (root:idcam 0640), or `auth.token` in config.yaml with the same mode. Production systemd sets `IDCAM_ENV=production` so `example.com` endpoints are rejected.
 
 ## I. Directory Structure
 
@@ -240,7 +240,8 @@ idCam/
 │   ├── status.py
 │   └── messages.py
 ├── storage/
-│   └── temp_files.py
+│   ├── temp_files.py
+│   └── paths.py
 ├── system/
 │   ├── health.py
 │   └── watchdog.py
@@ -249,8 +250,13 @@ idCam/
 ├── tests/
 │   ├── unit/
 │   └── integration/
+├── scripts/
+│   ├── install.sh
+│   └── uninstall.sh
 ├── deploy/
 │   ├── idcam.service
+│   ├── config.yaml.template
+│   ├── environment
 │   └── install.sh
 ├── docs/
 │   ├── ARCHITECTURE.md

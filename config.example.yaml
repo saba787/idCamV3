@@ -1,5 +1,6 @@
-# idCam configuration example
-# Copy to /etc/idcam/config.yaml and customize
+# idCam development / mock-camera example.
+# Do NOT copy this file to production as-is: it points at https://api.example.com.
+# Production installs use deploy/config.yaml.template via sudo ./scripts/install.sh.
 
 device_id: "pi5-doc-capture-001"
 

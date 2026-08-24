@@ -8,10 +8,11 @@
 
 ## Credentials
 
-- Auth tokens stored in `/etc/idcam/config.yaml` (mode 600) or `IDCAM_AUTH_TOKEN` environment variable
-- Tokens are **never** logged
-- Service runs as unprivileged `idcam` user
-- systemd unit uses `ProtectSystem=strict`, `NoNewPrivileges=true`
+- Auth tokens belong in `/etc/idcam/environment` as `IDCAM_AUTH_TOKEN` (root:idcam, mode 0640)
+- Tokens may also be set in `/etc/idcam/config.yaml` (`auth.token`); that file is root:idcam 0640 so the service can read it but not write it
+- Tokens are **never** logged and must not be committed to git
+- Service runs as unprivileged `idcam` user (never root)
+- systemd unit uses `ProtectSystem=strict`, `NoNewPrivileges=true`, `RuntimeDirectory=idcam`
 
 ## Input Validation
 
@@ -42,7 +43,7 @@
 ## Recommendations
 
 1. Use short-lived API tokens, rotate regularly
-2. Restrict `/etc/idcam/` permissions to root:idcam 750
+2. Restrict `/etc/idcam/` to root:idcam 0750; config and environment files 0640. Never make `/etc/idcam`, `/var/lib/idcam`, `/var/log/idcam`, or `/run/idcam` world-writable.
 3. Keep Raspberry Pi OS and Arducam drivers updated
 4. Use firewall rules to limit outbound connections to API host only
 5. Enable full-disk encryption if documents are sensitive

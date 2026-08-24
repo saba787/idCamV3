@@ -28,14 +28,13 @@ def main() -> None:
 
             config_path = Path(args.config)
         config = load_config(config_path)
+        setup_logging(config.logging)
+        use_mock = args.mock_camera or os.environ.get("IDCAM_MOCK_CAMERA", "").lower() in ("1", "true")
+        orchestrator = ApplicationOrchestrator(config, use_mock_camera=use_mock)
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
-    setup_logging(config.logging)
-    use_mock = args.mock_camera or os.environ.get("IDCAM_MOCK_CAMERA", "").lower() in ("1", "true")
-
-    orchestrator = ApplicationOrchestrator(config, use_mock_camera=use_mock)
     exit_code = asyncio.run(orchestrator.run())
     sys.exit(exit_code)
 

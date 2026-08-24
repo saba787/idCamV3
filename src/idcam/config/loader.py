@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from idcam.config.schema import AppConfig
+from idcam.config.schema import EXAMPLE_SERVER_HOSTS, AppConfig
 from idcam.exceptions import ConfigurationError
 
 
@@ -34,9 +34,14 @@ def load_config(path: Path | None = None) -> AppConfig:
     _apply_env_overrides(raw)
 
     try:
-        return AppConfig.model_validate(raw)
+        config = AppConfig.model_validate(raw)
+    except ConfigurationError:
+        raise
     except Exception as exc:
         raise ConfigurationError(f"Configuration validation failed: {exc}") from exc
+
+    _enforce_production_endpoint(config)
+    return config
 
 
 def _resolve_config_path() -> Path:
@@ -64,3 +69,19 @@ def _apply_env_overrides(raw: dict) -> None:
     if server_url:
         server = raw.setdefault("server", {})
         server["url"] = server_url
+
+
+def _production_mode() -> bool:
+    return os.environ.get("IDCAM_ENV", "").strip().lower() in {"production", "prod"}
+
+
+def _enforce_production_endpoint(config: AppConfig) -> None:
+    """Refuse placeholder example hosts when running as the production service."""
+    if not _production_mode():
+        return
+    host = (config.server.url.host or "").lower().rstrip(".")
+    if host in EXAMPLE_SERVER_HOSTS or host.endswith(".example.com"):
+        raise ConfigurationError(
+            f"Refusing to start: server.url ({config.server.url}) is a placeholder. "
+            "Set the real API URL in /etc/idcam/config.yaml or IDCAM_SERVER_URL."
+        )

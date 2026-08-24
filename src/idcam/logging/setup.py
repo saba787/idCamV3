@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from idcam.config.schema import LoggingConfig
+from idcam.storage.paths import ensure_writable_directory
 
 
 class JsonFormatter(logging.Formatter):
@@ -54,7 +55,7 @@ _context_filter = CaptureContextFilter()
 
 def setup_logging(config: LoggingConfig) -> logging.Logger:
     """Configure application logging with rotation."""
-    config.log_dir.mkdir(parents=True, exist_ok=True)
+    ensure_writable_directory(config.log_dir, "log")
     log_file = config.log_dir / "idcam.log"
 
     root = logging.getLogger("idcam")

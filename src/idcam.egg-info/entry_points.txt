@@ -1,0 +1,2 @@
+[console_scripts]
+idcam = app.main:main

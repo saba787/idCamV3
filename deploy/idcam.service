@@ -1,0 +1,43 @@
+[Unit]
+Description=idCam Document Capture Service
+Documentation=https://github.com/example/idcam
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=idcam
+Group=idcam
+WorkingDirectory=/opt/idcam
+
+# PDAF: uncomment if autofocus issues occur with embedded data parsing
+# Environment=LIBCAMERA_NOTPARSED_EMBEDDED_DATA=1
+
+Environment=IDCAM_CONFIG=/etc/idcam/config.yaml
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/idcam/venv/bin/idcam
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Directories
+RuntimeDirectory=idcam
+StateDirectory=idcam
+LogsDirectory=idcam
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/idcam /var/log/idcam /run/idcam
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

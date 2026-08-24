@@ -22,6 +22,7 @@ from idcam.config.schema import (
     QualityConfig,
     ServerConfig,
     StorageConfig,
+    UIConfig,
 )
 from idcam.network.protocol import ServerResponse, UploadOutcome, UploadRequest
 
@@ -42,6 +43,10 @@ def app_config(tmp_path):
         ),
         detection=DetectionConfig(stable_frames_required=2, removal_frames_required=2),
         camera=CameraConfig(recovery=CameraRecoveryConfig(max_attempts=3, delay_seconds=0.05)),
+        ui=UIConfig(
+            status_file=tmp_path / "run" / "status.json",
+            admin_socket=tmp_path / "run" / "admin.sock",
+        ),
     )
 
 

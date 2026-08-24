@@ -23,6 +23,7 @@ from idcam.config.schema import (
     QualityConfig,
     ServerConfig,
     StorageConfig,
+    UIConfig,
 )
 from idcam.exceptions import AutofocusError, CameraError, CaptureError
 from idcam.network.protocol import ServerResponse, UploadOutcome, UploadRequest
@@ -38,6 +39,10 @@ def app_config(tmp_path):
         quality=QualityConfig(min_sharpness=10.0, min_file_bytes=100, min_width=64, min_height=64, require_expected_dimensions=False),
         detection=DetectionConfig(stable_frames_required=2, removal_frames_required=2),
         camera=CameraConfig(recovery=CameraRecoveryConfig(max_attempts=3, delay_seconds=0.01)),
+        ui=UIConfig(
+            status_file=tmp_path / "run" / "status.json",
+            admin_socket=tmp_path / "run" / "admin.sock",
+        ),
     )
 
 

@@ -26,6 +26,7 @@ from idcam.config.schema import (
     ServerConfig,
     StateTimeoutsConfig,
     StorageConfig,
+    UIConfig,
 )
 from idcam.exceptions import ProtocolError
 from idcam.network.protocol import ServerResponse
@@ -45,6 +46,10 @@ def app_config(tmp_path):
         storage=StorageConfig(min_free_mb=100),
         quality=QualityConfig(min_sharpness=10.0, min_file_bytes=500, min_width=100, min_height=100, require_expected_dimensions=False),
         detection=DetectionConfig(stable_frames_required=3, removal_frames_required=3),
+        ui=UIConfig(
+            status_file=tmp_path / "run" / "status.json",
+            admin_socket=tmp_path / "run" / "admin.sock",
+        ),
     )
 
 

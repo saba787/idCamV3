@@ -5,7 +5,17 @@ import time
 import pytest
 
 from idcam.app.state_machine import AppState, StateMachine
+from idcam.config.schema import StateTimeoutsConfig
 from idcam.exceptions import StateMachineError
+
+
+@pytest.fixture
+def timeouts():
+    return StateTimeoutsConfig(
+        document_detected=5.0,
+        focusing=10.0,
+        waiting_for_stability=15.0,
+    )
 
 
 class TestStateMachine:
@@ -51,13 +61,21 @@ class TestStateMachine:
         sm.transition(AppState.RECOVERY)
         assert sm.state == AppState.RECOVERY
 
-    def test_timeout_detection(self):
+    def test_timeout_detection(self, timeouts):
         sm = StateMachine(state=AppState.DOCUMENT_DETECTED)
+        sm.set_timeouts(timeouts)
         sm.entered_at = time.monotonic() - 100
         assert sm.is_timed_out()
 
-    def test_no_timeout_for_idle(self):
+    def test_no_timeout_for_idle(self, timeouts):
         sm = StateMachine(state=AppState.IDLE)
+        sm.set_timeouts(timeouts)
+        sm.entered_at = time.monotonic() - 10000
+        assert not sm.is_timed_out()
+
+    def test_no_timeout_for_removal(self, timeouts):
+        sm = StateMachine(state=AppState.WAITING_FOR_REMOVAL)
+        sm.set_timeouts(timeouts)
         sm.entered_at = time.monotonic() - 10000
         assert not sm.is_timed_out()
 
@@ -66,3 +84,17 @@ class TestStateMachine:
         assert sm.in_transaction()
         sm = StateMachine(state=AppState.IDLE)
         assert not sm.in_transaction()
+
+    def test_touch_progress_does_not_reset_state_elapsed(self, timeouts):
+        sm = StateMachine(state=AppState.CAPTURING)
+        sm.set_timeouts(timeouts)
+        sm.entered_at = time.monotonic() - 100
+        sm.last_progress_at = time.monotonic()
+        # State timeout uses entered_at; progress is for watchdog
+        assert sm.is_timed_out()
+        assert sm.progress_idle() < 1.0
+
+    def test_per_state_timeout_from_config(self, timeouts):
+        sm = StateMachine(state=AppState.FOCUSING)
+        sm.set_timeouts(timeouts)
+        assert sm.timeout_for_state() == 10.0

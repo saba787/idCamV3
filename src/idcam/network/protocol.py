@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import Enum
-import secrets
-import string
+
+from idcam.exceptions import ProtocolError
 
 
 class UploadOutcome(str, Enum):
@@ -18,17 +17,13 @@ class UploadOutcome(str, Enum):
 
 
 @dataclass(frozen=True)
-class CaptureTransaction:
+class UploadRequest:
+    """HTTP upload payload — created only from an active capture transaction."""
+
     capture_id: str
     device_id: str
     image_path: str
     created_at: str
-
-    @staticmethod
-    def generate_id() -> str:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
-        return f"{ts}-{suffix}"
 
 
 @dataclass
@@ -41,12 +36,12 @@ class ServerResponse:
     outcome: UploadOutcome
 
     @classmethod
-    def from_http(cls, status: int, body: dict | None, capture_id: str) -> "ServerResponse":
+    def from_http(cls, status: int, body: dict | None, expected_capture_id: str) -> "ServerResponse":
         if body is None:
             if 200 <= status < 300:
                 return cls(
                     success=True,
-                    capture_id=capture_id,
+                    capture_id=expected_capture_id,
                     result=None,
                     message=None,
                     http_status=status,
@@ -55,7 +50,7 @@ class ServerResponse:
             if 400 <= status < 500:
                 return cls(
                     success=False,
-                    capture_id=capture_id,
+                    capture_id=expected_capture_id,
                     result=None,
                     message="Server rejected request",
                     http_status=status,
@@ -63,18 +58,46 @@ class ServerResponse:
                 )
             return cls(
                 success=False,
-                capture_id=capture_id,
+                capture_id=expected_capture_id,
                 result=None,
                 message="Server error",
                 http_status=status,
                 outcome=UploadOutcome.SERVER_ERROR,
             )
 
+        response_capture_id = body.get("capture_id")
+        if response_capture_id and response_capture_id != expected_capture_id:
+            raise ProtocolError(
+                f"Response capture_id mismatch: expected={expected_capture_id} got={response_capture_id}"
+            )
+
+        success = bool(body.get("success", 200 <= status < 300))
+        if 200 <= status < 300 and "success" not in body:
+            success = True
+
+        outcome = UploadOutcome.ACCEPTED if success and 200 <= status < 300 else UploadOutcome.REJECTED
+        if status >= 500:
+            outcome = UploadOutcome.SERVER_ERROR
+
         return cls(
-            success=bool(body.get("success", 200 <= status < 300)),
-            capture_id=body.get("capture_id", capture_id),
+            success=success and 200 <= status < 300,
+            capture_id=response_capture_id or expected_capture_id,
             result=body.get("result"),
             message=body.get("message") or body.get("error"),
             http_status=status,
-            outcome=UploadOutcome.ACCEPTED if body.get("success") else UploadOutcome.REJECTED,
+            outcome=outcome,
         )
+
+    @classmethod
+    def validate_json_body(cls, body: dict, expected_capture_id: str) -> None:
+        """Validate business response structure."""
+        if "success" not in body:
+            raise ProtocolError("Response missing required field: success")
+        if body.get("capture_id") and body["capture_id"] != expected_capture_id:
+            raise ProtocolError(
+                f"Response capture_id mismatch: expected={expected_capture_id} got={body['capture_id']}"
+            )
+
+
+# Backward compatibility alias
+CaptureTransaction = UploadRequest

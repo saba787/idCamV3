@@ -9,7 +9,7 @@ import respx
 from idcam.config.schema import AppConfig, AuthConfig, ServerConfig
 from idcam.exceptions import ServerRejectedError
 from idcam.network.api_client import ApiClient
-from idcam.network.protocol import CaptureTransaction, UploadOutcome
+from idcam.network.protocol import UploadOutcome, UploadRequest
 
 
 @pytest.fixture
@@ -30,8 +30,8 @@ def sample_image(tmp_path):
 
 @pytest.fixture
 def transaction(sample_image):
-    return CaptureTransaction(
-        capture_id="20260824-120000-ABC123",
+    return UploadRequest(
+        capture_id="cap-20260824120000abc123",
         device_id="test-pi",
         image_path=str(sample_image),
         created_at="2026-08-24T12:00:00Z",
@@ -45,7 +45,7 @@ class TestApiClient:
         route = respx.post("https://api.example.com/api/document").mock(
             return_value=httpx.Response(
                 200,
-                json={"success": True, "capture_id": transaction.capture_id, "result": "ok"},
+                json={"success": True, "capture_id": "cap-20260824120000abc123", "result": "ok"},
             )
         )
         client = ApiClient(app_config)
@@ -111,8 +111,8 @@ class TestApiClient:
 
     @pytest.mark.asyncio
     async def test_missing_image(self, app_config, tmp_path):
-        transaction = CaptureTransaction(
-            capture_id="test",
+        transaction = UploadRequest(
+            capture_id="cap-test",
             device_id="test-pi",
             image_path=str(tmp_path / "missing.jpg"),
             created_at="2026-08-24T12:00:00Z",

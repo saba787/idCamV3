@@ -61,6 +61,18 @@ class ServerError(NetworkError):
     recoverable = True
 
 
+class ProtocolError(NetworkError):
+    """Server response protocol violation."""
+
+    recoverable = False
+
+
+class StorageError(IdCamError):
+    """Insufficient storage for capture."""
+
+    recoverable = True
+
+
 class TransactionError(IdCamError):
     """Capture transaction failed."""
 

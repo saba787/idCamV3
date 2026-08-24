@@ -11,9 +11,9 @@ from idcam.camera.quality import ImageValidator
 from idcam.config.schema import AppConfig, QualityConfig, ServerConfig
 from idcam.exceptions import ConfigurationError, ImageValidationError
 from idcam.network.api_client import ApiClient
-from idcam.network.protocol import CaptureTransaction, UploadOutcome
+from idcam.network.protocol import UploadRequest, UploadOutcome
 from idcam.system.watchdog import Watchdog
-from idcam.config.schema import WatchdogConfig
+from idcam.config.schema import StateTimeoutsConfig, WatchdogConfig
 
 
 class TestFailureScenarios:
@@ -53,7 +53,7 @@ class TestFailureScenarios:
 
         with pytest.raises(ServerError):
             await client.upload_document(
-                CaptureTransaction("id", "d", str(img), "now")
+                UploadRequest("cap-id", "d", str(img), "now")
             )
         await client.stop()
 
@@ -70,7 +70,7 @@ class TestFailureScenarios:
 
         with pytest.raises(ServerRejectedError):
             await client.upload_document(
-                CaptureTransaction("id", "d", str(img), "now")
+                UploadRequest("cap-id", "d", str(img), "now")
             )
         await client.stop()
 
@@ -84,7 +84,7 @@ class TestFailureScenarios:
         respx.post("https://x.com/api/document").mock(side_effect=httpx.ConnectError("down"))
         client = ApiClient(config)
         await client.start()
-        resp = await client.upload_document(CaptureTransaction("id", "d", str(img), "now"))
+        resp = await client.upload_document(UploadRequest("cap-id", "d", str(img), "now"))
         assert resp.outcome == UploadOutcome.NEVER_SENT
         await client.stop()
 
@@ -100,7 +100,7 @@ class TestFailureScenarios:
         )
         client = ApiClient(config)
         await client.start()
-        resp = await client.upload_document(CaptureTransaction("id", "d", str(img), "now"))
+        resp = await client.upload_document(UploadRequest("cap-id", "d", str(img), "now"))
         assert resp.outcome == UploadOutcome.NEVER_SENT
         await client.stop()
 
@@ -112,10 +112,14 @@ class TestFailureScenarios:
 
     # 18. Stuck state detection
     def test_watchdog_stuck_focusing(self):
-        wd = Watchdog(WatchdogConfig(state_timeout_sec=10))
+        timeouts = StateTimeoutsConfig(focusing=10.0)
+        wd = Watchdog(WatchdogConfig(), timeouts)
         sm = StateMachine(state=AppState.FOCUSING)
+        sm.set_timeouts(timeouts)
         sm.entered_at = time.monotonic() - 20
-        assert wd.check(sm)
+        sm.last_progress_at = time.monotonic() - 20
+        alert = wd.check(sm)
+        assert alert is not None
 
     # 15. Processing blocks new capture
     def test_no_parallel_capture(self):

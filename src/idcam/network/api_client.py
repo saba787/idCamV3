@@ -8,9 +8,9 @@ from pathlib import Path
 import httpx
 
 from idcam.config.schema import AppConfig
-from idcam.exceptions import NetworkError, ServerError, ServerRejectedError
+from idcam.exceptions import NetworkError, ProtocolError, ServerError, ServerRejectedError
 from idcam.logging.setup import get_logger
-from idcam.network.protocol import CaptureTransaction, ServerResponse, UploadOutcome
+from idcam.network.protocol import ServerResponse, UploadOutcome, UploadRequest
 from idcam.network.retry_policy import RetryPolicy
 
 logger = get_logger("network.api_client")
@@ -43,7 +43,6 @@ class ApiClient:
             self._client = None
 
     async def check_connectivity(self) -> bool:
-        """Lightweight connectivity check (DNS + TCP). Does not upload."""
         if not self._client:
             await self.start()
         assert self._client is not None
@@ -54,12 +53,12 @@ class ApiClient:
         except httpx.HTTPError:
             return False
 
-    async def upload_document(self, transaction: CaptureTransaction) -> ServerResponse:
+    async def upload_document(self, request: UploadRequest) -> ServerResponse:
         if not self._client:
             await self.start()
         assert self._client is not None
 
-        image_path = Path(transaction.image_path)
+        image_path = Path(request.image_path)
         if not image_path.exists():
             raise NetworkError(f"Image not found for upload: {image_path}")
 
@@ -69,9 +68,9 @@ class ApiClient:
 
         url = str(self.config.server.url).rstrip("/") + self.config.server.path
         headers = {
-            "X-Device-ID": transaction.device_id,
-            "X-Capture-ID": transaction.capture_id,
-            "Idempotency-Key": transaction.capture_id,
+            "X-Device-ID": request.device_id,
+            "X-Capture-ID": request.capture_id,
+            "Idempotency-Key": request.capture_id,
         }
         token = self.config.auth.resolved_token()
         if token:
@@ -81,54 +80,76 @@ class ApiClient:
         while True:
             attempt += 1
             logger.info(
-                "Uploading capture_id=%s attempt=%d size=%d url=%s",
-                transaction.capture_id,
+                "event=upload_started capture_id=%s attempt=%d size=%d",
+                request.capture_id,
                 attempt,
                 file_size,
-                url,
             )
             try:
                 with image_path.open("rb") as image_file:
                     files = {"image": (image_path.name, image_file, "image/jpeg")}
                     response = await self._client.post(url, headers=headers, files=files)
 
-                body = None
+                body: dict | None = None
+                content_type = response.headers.get("content-type", "")
                 if response.content:
-                    try:
-                        body = response.json()
-                    except json.JSONDecodeError:
-                        logger.warning("Malformed JSON response for capture_id=%s", transaction.capture_id)
-                        if 200 <= response.status_code < 300:
-                            body = {"success": True, "capture_id": transaction.capture_id}
+                    if "application/json" in content_type or response.content[:1] in (b"{", b"["):
+                        try:
+                            parsed = response.json()
+                            if isinstance(parsed, dict):
+                                body = parsed
+                            else:
+                                raise ProtocolError("Response JSON is not an object")
+                        except json.JSONDecodeError as exc:
+                            logger.warning(
+                                "Malformed JSON response capture_id=%s: %s",
+                                request.capture_id,
+                                exc,
+                            )
+                            if 200 <= response.status_code < 300:
+                                body = {"success": True, "capture_id": request.capture_id}
+                            elif response.status_code >= 500:
+                                raise ServerError(f"Malformed JSON response: {exc}") from exc
+                            else:
+                                raise ProtocolError(f"Malformed JSON response: {exc}") from exc
+                    elif 200 <= response.status_code < 300:
+                        body = {"success": True, "capture_id": request.capture_id}
 
-                result = ServerResponse.from_http(response.status_code, body, transaction.capture_id)
+                if body is not None and isinstance(body, dict):
+                    ServerResponse.validate_json_body(body, request.capture_id)
+
+                result = ServerResponse.from_http(response.status_code, body, request.capture_id)
 
                 if 400 <= response.status_code < 500:
                     logger.error(
-                        "Server rejected upload capture_id=%s status=%d",
-                        transaction.capture_id,
+                        "event=upload_rejected capture_id=%s status=%d",
+                        request.capture_id,
                         response.status_code,
                     )
                     raise ServerRejectedError(result.message or "Server rejected request")
 
                 if response.status_code >= 500:
                     logger.error(
-                        "Server error capture_id=%s status=%d",
-                        transaction.capture_id,
+                        "event=upload_server_error capture_id=%s status=%d",
+                        request.capture_id,
                         response.status_code,
                     )
                     raise ServerError(result.message or "Server error")
 
                 logger.info(
-                    "Upload successful capture_id=%s status=%d outcome=%s",
-                    transaction.capture_id,
+                    "event=upload_completed capture_id=%s status=%d outcome=%s",
+                    request.capture_id,
                     response.status_code,
                     result.outcome.value,
                 )
                 return result
 
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
-                logger.warning("Upload connection error capture_id=%s: %s", transaction.capture_id, exc)
+            except ProtocolError:
+                raise
+            except (ServerRejectedError, ServerError):
+                raise
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                logger.warning("event=upload_connection_error capture_id=%s: %s", request.capture_id, exc)
                 if self.retry_policy.should_retry_connection(attempt):
                     import asyncio
 
@@ -136,17 +157,27 @@ class ApiClient:
                     continue
                 return ServerResponse(
                     success=False,
-                    capture_id=transaction.capture_id,
+                    capture_id=request.capture_id,
                     result=None,
                     message=str(exc),
                     http_status=0,
                     outcome=UploadOutcome.NEVER_SENT,
                 )
-            except httpx.HTTPError as exc:
-                logger.error("Upload HTTP error capture_id=%s: %s", transaction.capture_id, exc)
+            except httpx.ReadTimeout as exc:
+                logger.warning("event=upload_read_timeout capture_id=%s: %s", request.capture_id, exc)
                 return ServerResponse(
                     success=False,
-                    capture_id=transaction.capture_id,
+                    capture_id=request.capture_id,
+                    result=None,
+                    message=str(exc),
+                    http_status=0,
+                    outcome=UploadOutcome.SENT_UNKNOWN,
+                )
+            except httpx.HTTPError as exc:
+                logger.error("event=upload_http_error capture_id=%s: %s", request.capture_id, exc)
+                return ServerResponse(
+                    success=False,
+                    capture_id=request.capture_id,
                     result=None,
                     message=str(exc),
                     http_status=0,

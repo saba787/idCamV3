@@ -78,13 +78,7 @@ The application writes real-time status to `/run/idcam/status.json`:
 
 ## Server API
 
-```
-POST /api/document
-Headers: Authorization, X-Device-ID, X-Capture-ID, Idempotency-Key
-Body: multipart/form-data, field "image" (JPEG)
-```
-
-See `docs/ARCHITECTURE.md` for full protocol and delivery semantics.
+See [API Protocol](docs/API_PROTOCOL.md) for full idempotency and timeout semantics.
 
 ## Testing
 
@@ -93,6 +87,8 @@ pip install -e ".[dev]"
 pytest tests/ -v
 pytest tests/ -m hardware  # on Pi with camera
 ```
+
+Current test suite: **91 unit tests passing**, 3 hardware tests skipped off-device.
 
 ## Documentation
 

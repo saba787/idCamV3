@@ -9,9 +9,12 @@ src/idcam.egg-info/entry_points.txt
 src/idcam.egg-info/requires.txt
 src/idcam.egg-info/top_level.txt
 src/idcam/app/__init__.py
+src/idcam/app/admin.py
+src/idcam/app/long_run.py
 src/idcam/app/main.py
 src/idcam/app/orchestrator.py
 src/idcam/app/state_machine.py
+src/idcam/app/transaction.py
 src/idcam/camera/__init__.py
 src/idcam/camera/autofocus.py
 src/idcam/camera/capture.py
@@ -27,8 +30,10 @@ src/idcam/network/api_client.py
 src/idcam/network/protocol.py
 src/idcam/network/retry_policy.py
 src/idcam/storage/__init__.py
+src/idcam/storage/disk_monitor.py
 src/idcam/storage/temp_files.py
 src/idcam/system/__init__.py
+src/idcam/system/component_health.py
 src/idcam/system/health.py
 src/idcam/system/watchdog.py
 src/idcam/ui/__init__.py

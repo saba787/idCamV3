@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from idcam import __version__
 from idcam.config.loader import load_config
+from idcam.storage.disk_monitor import DiskMonitor
 
 
 def main() -> None:
@@ -20,6 +22,8 @@ def main() -> None:
     sub.add_parser("status", help="Show current status file")
     sub.add_parser("config", help="Show loaded configuration (secrets redacted)")
     sub.add_parser("validate", help="Validate configuration file")
+    sub.add_parser("health", help="Show system health snapshot")
+    sub.add_parser("storage", help="Show storage status")
 
     args = parser.parse_args()
 
@@ -53,6 +57,26 @@ def main() -> None:
         if data.get("auth", {}).get("token"):
             data["auth"]["token"] = "***REDACTED***"
         print(json.dumps(data, indent=2))
+        return
+
+    if args.command == "storage":
+        monitor = DiskMonitor(config.storage, config.temp_dir)
+        print(json.dumps(monitor.check().to_dict(), indent=2))
+        return
+
+    if args.command == "health":
+        status_file = config.ui.status_file
+        health = {
+            "version": __version__,
+            "config_valid": True,
+            "status_file": str(status_file),
+            "status_exists": status_file.exists(),
+            "storage": DiskMonitor(config.storage, config.temp_dir).check().to_dict(),
+            "timestamp": time.time(),
+        }
+        if status_file.exists():
+            health["status"] = json.loads(status_file.read_text(encoding="utf-8"))
+        print(json.dumps(health, indent=2))
 
 
 if __name__ == "__main__":

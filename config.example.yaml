@@ -18,6 +18,22 @@ auth:
   type: bearer
   token: ""  # Prefer IDCAM_AUTH_TOKEN env var
 
+storage:
+  min_free_mb: 1024
+  stale_temp_max_age_sec: 3600
+  capture_reserve_mb: 200
+
+state_timeouts:
+  document_detected: 5
+  waiting_for_stability: 15
+  focusing: 10
+  focus_verification: 5
+  capturing: 45
+  image_validation: 10
+  uploading: 60
+  waiting_for_server: 60
+  processing_response: 10
+
 camera:
   preview_width: 1920
   preview_height: 1080
@@ -26,10 +42,12 @@ camera:
   jpeg_quality: 95
   preview_fps: 5
   af_max_retries: 3
-  af_timeout_sec: 30
-  capture_timeout_sec: 60
-  recovery_max_attempts: 3
-  recovery_delay_sec: 5
+  af_timeout_sec: 10
+  af_verify_max_retries: 2
+  capture_timeout_sec: 45
+  recovery:
+    max_attempts: 3
+    delay_seconds: 2
 
 detection:
   roi_center_fraction: 0.7
@@ -37,6 +55,8 @@ detection:
   edge_density_threshold: 0.02
   stable_frames_required: 8
   removal_frames_required: 10
+  removal_motion_factor: 0.5
+  removal_edge_factor: 0.5
   baseline_alpha: 0.05
 
 quality:
@@ -47,6 +67,8 @@ quality:
   max_brightness: 225.0
   min_width: 640
   min_height: 480
+  require_expected_dimensions: false
+  dimension_tolerance: 64
 
 logging:
   level: INFO

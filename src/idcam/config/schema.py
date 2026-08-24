@@ -35,6 +35,11 @@ class AuthConfig(BaseModel):
         return self.token
 
 
+class CameraRecoveryConfig(BaseModel):
+    max_attempts: int = Field(3, ge=1, le=10)
+    delay_seconds: float = Field(2.0, gt=0, le=60)
+
+
 class CameraConfig(BaseModel):
     preview_width: int = Field(1920, ge=320, le=3840)
     preview_height: int = Field(1080, ge=240, le=2160)
@@ -43,10 +48,18 @@ class CameraConfig(BaseModel):
     jpeg_quality: int = Field(95, ge=50, le=100)
     preview_fps: float = Field(5.0, gt=0, le=30)
     af_max_retries: int = Field(3, ge=1, le=10)
-    af_timeout_sec: float = Field(30.0, gt=0, le=120)
-    capture_timeout_sec: float = Field(60.0, gt=0, le=300)
-    recovery_max_attempts: int = Field(3, ge=1, le=10)
-    recovery_delay_sec: float = Field(5.0, gt=0, le=60)
+    af_timeout_sec: float = Field(10.0, gt=0, le=120)
+    af_verify_max_retries: int = Field(2, ge=1, le=5)
+    capture_timeout_sec: float = Field(45.0, gt=0, le=300)
+    recovery: CameraRecoveryConfig = CameraRecoveryConfig()
+
+    @property
+    def recovery_max_attempts(self) -> int:
+        return self.recovery.max_attempts
+
+    @property
+    def recovery_delay_sec(self) -> float:
+        return self.recovery.delay_seconds
 
 
 class DetectionConfig(BaseModel):
@@ -55,6 +68,8 @@ class DetectionConfig(BaseModel):
     edge_density_threshold: float = Field(0.02, gt=0, le=1.0)
     stable_frames_required: int = Field(8, ge=2, le=60)
     removal_frames_required: int = Field(10, ge=2, le=120)
+    removal_motion_factor: float = Field(0.5, gt=0, le=1.0)
+    removal_edge_factor: float = Field(0.5, gt=0, le=2.0)
     baseline_alpha: float = Field(0.05, gt=0, le=1.0)
 
 
@@ -66,6 +81,54 @@ class QualityConfig(BaseModel):
     max_brightness: float = Field(225.0, ge=0, le=255)
     min_width: int = Field(640, gt=0)
     min_height: int = Field(480, gt=0)
+    require_expected_dimensions: bool = True
+    dimension_tolerance: int = Field(64, ge=0, le=512)
+
+
+class StorageConfig(BaseModel):
+    min_free_mb: int = Field(1024, ge=100, le=100_000)
+    stale_temp_max_age_sec: float = Field(3600.0, gt=60, le=86400)
+    capture_reserve_mb: int = Field(200, ge=50, le=5000)
+
+
+class StateTimeoutsConfig(BaseModel):
+    """Per-state timeout configuration (seconds). None-equivalent = very large."""
+
+    boot: float = Field(10.0, gt=0, le=120)
+    initializing: float = Field(60.0, gt=0, le=300)
+    camera_initializing: float = Field(120.0, gt=0, le=600)
+    document_detected: float = Field(5.0, gt=0, le=60)
+    waiting_for_stability: float = Field(15.0, gt=0, le=120)
+    focusing: float = Field(10.0, gt=0, le=120)
+    focus_verification: float = Field(5.0, gt=0, le=60)
+    capturing: float = Field(45.0, gt=0, le=300)
+    image_validation: float = Field(10.0, gt=0, le=60)
+    uploading: float = Field(60.0, gt=0, le=600)
+    waiting_for_server: float = Field(60.0, gt=0, le=600)
+    processing_response: float = Field(10.0, gt=0, le=60)
+    success: float = Field(5.0, gt=0, le=30)
+    recovery: float = Field(180.0, gt=0, le=600)
+    shutdown: float = Field(30.0, gt=0, le=120)
+
+    def for_state(self, state_name: str) -> float | None:
+        mapping = {
+            "BOOT": self.boot,
+            "INITIALIZING": self.initializing,
+            "CAMERA_INITIALIZING": self.camera_initializing,
+            "DOCUMENT_DETECTED": self.document_detected,
+            "WAITING_FOR_STABILITY": self.waiting_for_stability,
+            "FOCUSING": self.focusing,
+            "FOCUS_VERIFICATION": self.focus_verification,
+            "CAPTURING": self.capturing,
+            "IMAGE_VALIDATION": self.image_validation,
+            "UPLOADING": self.uploading,
+            "WAITING_FOR_SERVER": self.waiting_for_server,
+            "PROCESSING_RESPONSE": self.processing_response,
+            "SUCCESS": self.success,
+            "RECOVERY": self.recovery,
+            "SHUTDOWN": self.shutdown,
+        }
+        return mapping.get(state_name)
 
 
 class LoggingConfig(BaseModel):
@@ -95,6 +158,8 @@ class AppConfig(BaseModel):
     camera: CameraConfig = CameraConfig()
     detection: DetectionConfig = DetectionConfig()
     quality: QualityConfig = QualityConfig()
+    storage: StorageConfig = StorageConfig()
+    state_timeouts: StateTimeoutsConfig = StateTimeoutsConfig()
     logging: LoggingConfig = LoggingConfig()
     ui: UIConfig = UIConfig()
     watchdog: WatchdogConfig = WatchdogConfig()

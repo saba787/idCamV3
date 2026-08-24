@@ -5,8 +5,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from idcam.exceptions import StateMachineError
+
+if TYPE_CHECKING:
+    from idcam.config.schema import StateTimeoutsConfig
 
 
 class AppState(str, Enum):
@@ -31,27 +35,12 @@ class AppState(str, Enum):
     SHUTDOWN = "SHUTDOWN"
 
 
-# States with bounded timeouts (seconds). None = no timeout.
-STATE_TIMEOUTS: dict[AppState, float | None] = {
-    AppState.BOOT: 10.0,
-    AppState.INITIALIZING: 60.0,
-    AppState.CAMERA_INITIALIZING: 120.0,
-    AppState.CAMERA_READY: None,
-    AppState.IDLE: None,
-    AppState.DOCUMENT_DETECTED: 30.0,
-    AppState.WAITING_FOR_STABILITY: 15.0,
-    AppState.FOCUSING: 30.0,
-    AppState.FOCUS_VERIFICATION: 10.0,
-    AppState.CAPTURING: 60.0,
-    AppState.IMAGE_VALIDATION: 10.0,
-    AppState.UPLOADING: None,  # configured per-request
-    AppState.WAITING_FOR_SERVER: None,
-    AppState.PROCESSING_RESPONSE: 10.0,
-    AppState.SUCCESS: 5.0,
-    AppState.WAITING_FOR_REMOVAL: 120.0,
-    AppState.RECOVERY: 180.0,
-    AppState.ERROR: None,
-    AppState.SHUTDOWN: 30.0,
+# States with no timeout (must not block forever via watchdog elsewhere)
+NO_TIMEOUT_STATES = {
+    AppState.CAMERA_READY,
+    AppState.IDLE,
+    AppState.WAITING_FOR_REMOVAL,  # removal is mandatory; no idle escape via timeout
+    AppState.ERROR,
 }
 
 ALLOWED_TRANSITIONS: dict[AppState, set[AppState]] = {
@@ -60,12 +49,12 @@ ALLOWED_TRANSITIONS: dict[AppState, set[AppState]] = {
     AppState.CAMERA_INITIALIZING: {AppState.CAMERA_READY, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
     AppState.CAMERA_READY: {AppState.IDLE, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
     AppState.IDLE: {AppState.DOCUMENT_DETECTED, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
-    AppState.DOCUMENT_DETECTED: {AppState.WAITING_FOR_STABILITY, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.WAITING_FOR_STABILITY: {AppState.FOCUSING, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.FOCUSING: {AppState.FOCUS_VERIFICATION, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
-    AppState.FOCUS_VERIFICATION: {AppState.CAPTURING, AppState.FOCUSING, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.CAPTURING: {AppState.IMAGE_VALIDATION, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.IMAGE_VALIDATION: {AppState.UPLOADING, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.DOCUMENT_DETECTED: {AppState.WAITING_FOR_STABILITY, AppState.IDLE, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.WAITING_FOR_STABILITY: {AppState.FOCUSING, AppState.IDLE, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.FOCUSING: {AppState.FOCUS_VERIFICATION, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
+    AppState.FOCUS_VERIFICATION: {AppState.CAPTURING, AppState.FOCUSING, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.CAPTURING: {AppState.IMAGE_VALIDATION, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.IMAGE_VALIDATION: {AppState.UPLOADING, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
     AppState.UPLOADING: {AppState.WAITING_FOR_SERVER, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
     AppState.WAITING_FOR_SERVER: {AppState.PROCESSING_RESPONSE, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
     AppState.PROCESSING_RESPONSE: {AppState.SUCCESS, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
@@ -79,11 +68,16 @@ ALLOWED_TRANSITIONS: dict[AppState, set[AppState]] = {
 
 @dataclass
 class StateMachine:
-    """Explicit deterministic state machine."""
+    """Explicit deterministic state machine with configurable per-state timeouts."""
 
     state: AppState = AppState.BOOT
     entered_at: float = field(default_factory=time.monotonic)
+    last_progress_at: float = field(default_factory=time.monotonic)
     transition_count: int = 0
+    _timeouts: StateTimeoutsConfig | None = field(default=None, repr=False)
+
+    def set_timeouts(self, timeouts: StateTimeoutsConfig) -> None:
+        self._timeouts = timeouts
 
     def can_transition(self, target: AppState) -> bool:
         return target in ALLOWED_TRANSITIONS.get(self.state, set())
@@ -94,15 +88,32 @@ class StateMachine:
                 f"Invalid transition {self.state.value} -> {target.value}" + (f": {reason}" if reason else "")
             )
         self.state = target
-        self.entered_at = time.monotonic()
+        now = time.monotonic()
+        self.entered_at = now
+        self.last_progress_at = now
         self.transition_count += 1
         return self.state
+
+    def touch_progress(self) -> None:
+        """Record progress within current state (resets watchdog stall detection)."""
+        self.last_progress_at = time.monotonic()
 
     def elapsed(self) -> float:
         return time.monotonic() - self.entered_at
 
+    def progress_idle(self) -> float:
+        return time.monotonic() - self.last_progress_at
+
+    def timeout_for_state(self, state: AppState | None = None) -> float | None:
+        target = state or self.state
+        if target in NO_TIMEOUT_STATES:
+            return None
+        if self._timeouts is not None:
+            return self._timeouts.for_state(target.value)
+        return None
+
     def is_timed_out(self, override_timeout: float | None = None) -> bool:
-        timeout = override_timeout if override_timeout is not None else STATE_TIMEOUTS.get(self.state)
+        timeout = override_timeout if override_timeout is not None else self.timeout_for_state()
         if timeout is None:
             return False
         return self.elapsed() > timeout
@@ -120,5 +131,6 @@ class StateMachine:
             AppState.WAITING_FOR_SERVER,
             AppState.PROCESSING_RESPONSE,
             AppState.SUCCESS,
+            AppState.WAITING_FOR_REMOVAL,
         }
         return self.state in transactional

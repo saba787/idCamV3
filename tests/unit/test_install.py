@@ -173,13 +173,18 @@ REQUIRED_RUNTIME_APT = frozenset(
         "python3-pip",
         "python3-venv",
         "python3-dev",
-        "python3-kms++",
         "python3-libcamera",
         "python3-picamera2",
-        "libcamera-dev",
         "v4l-utils",
         "wget",
         "curl",
+    }
+)
+
+RECOMMENDED_RUNTIME_APT = frozenset(
+    {
+        "python3-kms++",
+        "libcamera-dev",
     }
 )
 
@@ -199,26 +204,33 @@ def _parse_bash_array(text: str, name: str) -> list[str]:
 def test_installer_does_not_require_libatlas_on_debian_trixie():
     text = INSTALL_SH.read_text(encoding="utf-8")
     required = _parse_bash_array(text, "IDC_APT_REQUIRED")
+    recommended = _parse_bash_array(text, "IDC_APT_RECOMMENDED")
     camera_cli = _parse_bash_array(text, "IDC_APT_CAMERA_CLI")
-    all_pkgs = set(required) | set(camera_cli)
+    all_pkgs = set(required) | set(recommended) | set(camera_cli)
 
     assert TRIXIE_UNAVAILABLE_APT.isdisjoint(all_pkgs)
-    assert REQUIRED_RUNTIME_APT.issubset(set(required))
+    assert REQUIRED_RUNTIME_APT == set(required)
+    assert RECOMMENDED_RUNTIME_APT == set(recommended)
     assert "libcamera-apps" not in required
+    assert "libatlas-base-dev" not in required
     assert "rpicam-apps" in camera_cli
     assert "libcamera-apps" in camera_cli
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
-        assert "libatlas-base-dev" not in stripped
-        assert "libatlas" not in stripped
+        if "apt-get install" in stripped or "IDC_APT_" in stripped:
+            assert "libatlas-base-dev" not in stripped
+            assert "libatlas" not in stripped
 
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert "numpy>=" in pyproject
     assert "opencv-python-headless>=" in pyproject
     assert "atlas" not in pyproject.lower()
     assert "libatlas" not in pyproject.lower()
+    assert "--system-site-packages" in text
+    assert "python3-picamera2" in required
+    assert "python3-libcamera" in required
 
 
 def test_deploy_wrapper_does_not_add_apt_packages():
@@ -229,10 +241,37 @@ def test_deploy_wrapper_does_not_add_apt_packages():
 
 def test_installer_does_not_rewrite_operator_apt_sources():
     text = INSTALL_SH.read_text(encoding="utf-8")
-    assert "/etc/apt/sources.list" not in text
-    assert "sources.list.d" not in text
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert not stripped.startswith("sed ") or "sources.list" not in stripped
+        assert "tee " not in stripped or "sources.list" not in stripped
+        assert "rm " not in stripped or "sources.list" not in stripped
+    assert "will not modify" in text
     assert "configured multiple times" in text
-    assert "leaving existing sources unchanged" in text
+    assert "leaving existing sources unchanged" not in text or "will not modify" in text
+
+
+def test_required_apt_failures_are_not_swallowed():
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "install_required_apt_packages" in text
+    assert "require_apt_candidates" in text
+    in_required = False
+    for line in text.splitlines():
+        if line.startswith("install_required_apt_packages()"):
+            in_required = True
+            continue
+        if in_required:
+            if line.startswith("}") and "||" not in line:
+                break
+            if "apt-get install" in line:
+                assert "|| true" not in line
+                assert "||true" not in line
+            if line.startswith("}"):
+                break
+    assert "This is a hard failure" in text
+    assert "have no installation candidate" in text
 
 
 @pytest.mark.skipif(_bash() is None, reason="bash is required to expand installer apt arrays")
@@ -240,8 +279,9 @@ def test_apt_package_arrays_expand_without_trixie_removed_packages():
     bash = _bash()
     script = f"""
 set -euo pipefail
-eval "$(sed -n '/^IDC_APT_REQUIRED=(/,/^)/p; /^IDC_APT_CAMERA_CLI=(/,/^)/p' '{_posix(INSTALL_SH)}')"
+eval "$(sed -n '/^IDC_APT_REQUIRED=(/,/^)/p; /^IDC_APT_RECOMMENDED=(/,/^)/p; /^IDC_APT_CAMERA_CLI=(/,/^)/p' '{_posix(INSTALL_SH)}')"
 printf 'REQ:%s\\n' "${{IDC_APT_REQUIRED[@]}}"
+printf 'REC:%s\\n' "${{IDC_APT_RECOMMENDED[@]}}"
 printf 'CLI:%s\\n' "${{IDC_APT_CAMERA_CLI[@]}}"
 """
     result = subprocess.run(
@@ -260,10 +300,17 @@ printf 'CLI:%s\\n' "${{IDC_APT_CAMERA_CLI[@]}}"
         for line in result.stdout.splitlines()
         if line.startswith("CLI:")
     }
+    recommended = {
+        line.split(":", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("REC:")
+    }
     assert required
     assert camera_cli
-    assert TRIXIE_UNAVAILABLE_APT.isdisjoint(required | camera_cli)
-    assert REQUIRED_RUNTIME_APT.issubset(required)
+    assert recommended
+    assert TRIXIE_UNAVAILABLE_APT.isdisjoint(required | recommended | camera_cli)
+    assert REQUIRED_RUNTIME_APT == required
+    assert RECOMMENDED_RUNTIME_APT == recommended
 
 
 @pytest.mark.skipif(_bash() is None, reason="bash is required for staging installer test")
@@ -282,8 +329,12 @@ def test_staging_install_is_idempotent_and_preserves_config(tmp_path):
     first = subprocess.run(cmd, check=True, env=env, capture_output=True, text=True)
     assert first.returncode == 0
     combined = f"{first.stdout}\n{first.stderr}"
-    assert "Installing system packages" not in combined
+    assert "Skipping apt package installation" in combined
     assert "libatlas-base-dev" not in combined
+    for n in range(1, 9):
+        assert f"[{n}/8]" in combined
+    assert "Python/camera import checks skipped" in combined
+    assert "Validation passed" in combined
 
     config = staging / "etc" / "idcam" / "config.yaml"
     env_file = staging / "etc" / "idcam" / "environment"
@@ -299,8 +350,14 @@ def test_staging_install_is_idempotent_and_preserves_config(tmp_path):
     assert tmp_dir.is_dir()
     assert logs.is_dir()
     assert not run_dir.exists()
-    assert "RuntimeDirectory=idcam" in unit.read_text(encoding="utf-8")
+    unit_text = unit.read_text(encoding="utf-8")
+    assert "RuntimeDirectory=idcam" in unit_text
+    assert "User=idcam" in unit_text
+    assert "Group=idcam" in unit_text
+    assert "User=root" not in unit_text
     assert "CHANGE_ME" in config.read_text(encoding="utf-8")
+    assert "unconfigured.invalid" in config.read_text(encoding="utf-8")
+    assert "api.example.com" not in config.read_text(encoding="utf-8")
 
     marker = "device_id: preserved-device\n"
     config.write_text(config.read_text(encoding="utf-8") + "\n# preserved\n", encoding="utf-8")
@@ -320,3 +377,43 @@ def test_staging_install_is_idempotent_and_preserves_config(tmp_path):
         for directory in (staging / "etc" / "idcam", state, tmp_dir, logs):
             mode = stat.S_IMODE(directory.stat().st_mode)
             assert mode & stat.S_IWOTH == 0, f"{directory} is world-writable"
+
+
+@pytest.mark.skipif(_bash() is None, reason="bash is required to source installer functions")
+def test_sourcing_installer_does_not_mutate_the_system(tmp_path):
+    bash = _bash()
+    script = f"""
+source '{_posix(INSTALL_SH)}'
+echo SOURCED_OK
+"""
+    result = subprocess.run(
+        [bash, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert "SOURCED_OK" in result.stdout
+    assert "[1/8]" not in combined
+    assert not (tmp_path / "opt").exists()
+    assert not (tmp_path / "etc").exists()
+
+
+@pytest.mark.skipif(_bash() is None, reason="bash is required to test apt candidate failure")
+def test_missing_required_package_fails_cleanly_with_package_name():
+    bash = _bash()
+    script = f"""
+source '{_posix(INSTALL_SH)}'
+apt_has_candidate() {{ return 1; }}
+require_apt_candidates definitely-not-a-real-idcam-package
+echo SHOULD_NOT_REACH
+"""
+    result = subprocess.run([bash, "-c", script], capture_output=True, text=True)
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0
+    assert "definitely-not-a-real-idcam-package" in combined
+    assert "no installation candidate" in combined
+    assert "SHOULD_NOT_REACH" not in combined
+    assert "[4/8]" not in combined
+    assert "Creating idcam service user" not in combined

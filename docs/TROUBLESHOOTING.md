@@ -1,5 +1,36 @@
 # Troubleshooting Guide
 
+## Installer
+
+The supported first install is `sudo bash ./scripts/install.sh`. It installs OS
+packages, the camera Python stack (`python3-picamera2`, `python3-libcamera`), and
+the application. Do not work around installer failures by running `apt install`
+for those packages by hand.
+
+### Required package has no installation candidate
+
+The installer lists the exact package and stops. Common causes:
+
+- Not Raspberry Pi OS 64-bit (vanilla Debian does not ship `python3-picamera2`)
+- Mixing Ubuntu package names (for example `libatlas-base-dev` / `libopenblas-base`)
+- Broken or unreachable Raspberry Pi apt repositories
+
+`libatlas-base-dev` is **not** required (Debian Trixie removed ATLAS; numpy/opencv
+are PyPI wheels). Re-run the installer after the OS/repository is corrected.
+
+### Duplicate APT sources (`configured multiple times`)
+
+Raspberry Pi OS may warn that the same Debian suite is listed in
+`/etc/apt/sources.list` and `/etc/apt/sources.list.d/debian.sources`. That is an
+environment issue. The installer ignores those warnings and **does not** rewrite
+APT sources. Real `E:` apt errors still fail the install.
+
+### Camera packages installed but sensor not detected
+
+OS Picamera2/libcamera packages can be present before the Arducam 64MP overlay
+is active. See [Camera](#camera). After the overlay is in
+`/boot/firmware/config.txt`, reboot, then re-run the installer if needed.
+
 ## Camera
 
 ### Camera not detected
@@ -107,7 +138,7 @@ Edit `/etc/idcam/config.yaml` and `/etc/idcam/environment`, then `sudo systemctl
 Do not `mkdir`/`chmod` those paths by hand and do not run the app with sudo.
 
 ```bash
-sudo ./scripts/install.sh
+sudo bash ./scripts/install.sh
 sudo systemctl restart idcam
 ```
 

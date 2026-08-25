@@ -26,23 +26,45 @@ Continuously monitors the capture area, detects documents, stabilizes, autofocus
 
 ## Production installation on Raspberry Pi
 
-On a fresh Raspberry Pi OS (Bookworm/Trixie, 64-bit) the operator does **not** create
-`/var/log/idcam`, `/var/lib/idcam`, or `/run/idcam` by hand. The installer and systemd own those paths.
+On a fresh Raspberry Pi OS (**Bookworm or Trixie, 64-bit / arm64**) the intended
+first-install flow is:
 
 ```bash
 git clone https://github.com/shipittofar/idCamV3.git
 cd idCamV3
-sudo ./scripts/install.sh
+sudo bash ./scripts/install.sh
 ```
 
-The installer creates the `idcam` system user and group, installs the app into
-`/opt/idcam/venv`, writes a first-boot config **only if** `/etc/idcam/config.yaml`
-does not already exist, installs `/etc/systemd/system/idcam.service`, reloads
-systemd, and enables the unit. It does **not** start the service until
-`device_id` and `server.url` are real values (the shipped template uses
-`CHANGE_ME` / `https://unconfigured.invalid` and will fail validation on purpose).
+The installer is the bootstrap. It installs OS packages, the `idcam` system user,
+application venv, production config template, and systemd unit. **Do not**
+pre-create `/etc/idcam`, `/var/lib/idcam`, `/var/log/idcam`, or `/run/idcam`, and
+**do not** install Python/camera packages by hand to work around the installer.
 
-Configure the device:
+The installer walks eight steps:
+
+1. Checking supported OS (Raspberry Pi OS 64-bit, Bookworm/Trixie)
+2. Checking package manager
+3. Installing system dependencies (`python3-picamera2` / `python3-libcamera` from apt;
+   numpy and OpenCV from PyPI wheels — not `libatlas-base-dev`, which Trixie removed)
+4. Creating the `idcam` service user and directories
+5. Installing the Python application into `/opt/idcam/venv` (`--system-site-packages`
+   so Picamera2 comes from Raspberry Pi OS, not pip)
+6. Installing configuration and the systemd unit
+7. Validating camera/application environment
+8. Final installation validation
+
+It creates the `idcam` user/group (not root), writes a first-boot config **only if**
+`/etc/idcam/config.yaml` does not already exist, installs
+`/etc/systemd/system/idcam.service`, reloads systemd, and enables the unit. It does
+**not** start the service until `device_id` and `server.url` are real values (the
+shipped template uses `CHANGE_ME` / `https://unconfigured.invalid` and will fail
+validation on purpose). Duplicate APT-source warnings on the Pi are ignored; the
+installer does not rewrite `/etc/apt`.
+
+If a **required** package has no installation candidate, the installer stops with
+that package name and does not continue as if install succeeded.
+
+Site-specific values the installer cannot guess — set these after the first run:
 
 ```bash
 sudo nano /etc/idcam/config.yaml
@@ -87,7 +109,7 @@ Existing config, token, captured data, and logs are preserved.
 ```bash
 cd idCamV3
 git pull
-sudo ./scripts/install.sh
+sudo bash ./scripts/install.sh
 sudo systemctl restart idcam   # if the service was not already running
 ```
 
@@ -142,10 +164,10 @@ See [API Protocol](docs/API_PROTOCOL.md) for full idempotency and timeout semant
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -v
-pytest tests/ -m hardware  # on Pi with camera
+IDC_RUN_HARDWARE_TESTS=1 pytest tests/ -v -m hardware  # on Pi with camera
 ```
 
-Current test suite: **133 unit tests passing**, 3 hardware tests skipped off-device.
+Hardware tests are skipped off-device. Run the full suite after installer changes.
 
 ## Documentation
 

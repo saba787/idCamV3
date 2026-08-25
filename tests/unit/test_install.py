@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -155,6 +156,116 @@ def _posix(path: Path) -> str:
     return text
 
 
+# Packages Debian Trixie / Raspberry Pi OS Trixie do not ship. The installer
+# must not require these — numpy/opencv come from PyPI wheels, not ATLAS.
+TRIXIE_UNAVAILABLE_APT = frozenset(
+    {
+        "libatlas-base-dev",
+        "libatlas3-base",
+        "libatlas-base",
+        "libopenblas-base",  # Ubuntu name; not a Pi OS / Trixie package
+    }
+)
+
+REQUIRED_RUNTIME_APT = frozenset(
+    {
+        "python3",
+        "python3-pip",
+        "python3-venv",
+        "python3-dev",
+        "python3-kms++",
+        "python3-libcamera",
+        "python3-picamera2",
+        "libcamera-dev",
+        "v4l-utils",
+        "wget",
+        "curl",
+    }
+)
+
+
+def _parse_bash_array(text: str, name: str) -> list[str]:
+    match = re.search(rf"{re.escape(name)}=\((.*?)\)", text, re.S)
+    if not match:
+        raise AssertionError(f"bash array {name} not found in install.sh")
+    tokens: list[str] = []
+    for line in match.group(1).splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped:
+            tokens.extend(stripped.split())
+    return tokens
+
+
+def test_installer_does_not_require_libatlas_on_debian_trixie():
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    required = _parse_bash_array(text, "IDC_APT_REQUIRED")
+    camera_cli = _parse_bash_array(text, "IDC_APT_CAMERA_CLI")
+    all_pkgs = set(required) | set(camera_cli)
+
+    assert TRIXIE_UNAVAILABLE_APT.isdisjoint(all_pkgs)
+    assert REQUIRED_RUNTIME_APT.issubset(set(required))
+    assert "libcamera-apps" not in required
+    assert "rpicam-apps" in camera_cli
+    assert "libcamera-apps" in camera_cli
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert "libatlas-base-dev" not in stripped
+        assert "libatlas" not in stripped
+
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "numpy>=" in pyproject
+    assert "opencv-python-headless>=" in pyproject
+    assert "atlas" not in pyproject.lower()
+    assert "libatlas" not in pyproject.lower()
+
+
+def test_deploy_wrapper_does_not_add_apt_packages():
+    text = (ROOT / "deploy" / "install.sh").read_text(encoding="utf-8")
+    assert "libatlas-base-dev" not in text
+    assert "scripts/install.sh" in text
+
+
+def test_installer_does_not_rewrite_operator_apt_sources():
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "/etc/apt/sources.list" not in text
+    assert "sources.list.d" not in text
+    assert "configured multiple times" in text
+    assert "leaving existing sources unchanged" in text
+
+
+@pytest.mark.skipif(_bash() is None, reason="bash is required to expand installer apt arrays")
+def test_apt_package_arrays_expand_without_trixie_removed_packages():
+    bash = _bash()
+    script = f"""
+set -euo pipefail
+eval "$(sed -n '/^IDC_APT_REQUIRED=(/,/^)/p; /^IDC_APT_CAMERA_CLI=(/,/^)/p' '{_posix(INSTALL_SH)}')"
+printf 'REQ:%s\\n' "${{IDC_APT_REQUIRED[@]}}"
+printf 'CLI:%s\\n' "${{IDC_APT_CAMERA_CLI[@]}}"
+"""
+    result = subprocess.run(
+        [bash, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    required = {
+        line.split(":", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("REQ:")
+    }
+    camera_cli = {
+        line.split(":", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("CLI:")
+    }
+    assert required
+    assert camera_cli
+    assert TRIXIE_UNAVAILABLE_APT.isdisjoint(required | camera_cli)
+    assert REQUIRED_RUNTIME_APT.issubset(required)
+
+
 @pytest.mark.skipif(_bash() is None, reason="bash is required for staging installer test")
 def test_staging_install_is_idempotent_and_preserves_config(tmp_path):
     bash = _bash()
@@ -170,6 +281,9 @@ def test_staging_install_is_idempotent_and_preserves_config(tmp_path):
     env.pop("IDC_AUTH_TOKEN", None)
     first = subprocess.run(cmd, check=True, env=env, capture_output=True, text=True)
     assert first.returncode == 0
+    combined = f"{first.stdout}\n{first.stderr}"
+    assert "Installing system packages" not in combined
+    assert "libatlas-base-dev" not in combined
 
     config = staging / "etc" / "idcam" / "config.yaml"
     env_file = staging / "etc" / "idcam" / "environment"

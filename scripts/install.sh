@@ -16,6 +16,25 @@ IDC_VERSION="1.0.0"
 SERVICE_USER="idcam"
 SERVICE_GROUP="idcam"
 
+# OS packages the installer actually needs.
+# numpy and opencv-python-headless are installed from PyPI wheels (they bundle
+# OpenBLAS). Do not install libatlas-base-dev: ATLAS was dropped in Debian
+# Trixie / Raspberry Pi OS Trixie and is not a runtime requirement.
+IDC_APT_REQUIRED=(
+    python3 python3-pip python3-venv python3-dev
+    python3-kms++ python3-libcamera python3-picamera2
+    libcamera-dev
+    v4l-utils
+    wget curl
+)
+
+# Camera CLI tools. Raspberry Pi OS renamed libcamera-apps -> rpicam-apps;
+# Bookworm still has a dummy libcamera-apps. Install whichever candidates exist.
+IDC_APT_CAMERA_CLI=(
+    rpicam-apps
+    libcamera-apps
+)
+
 STAGING_ROOT=""
 START_SERVICE=0
 SKIP_APT=0
@@ -138,19 +157,61 @@ check_prerequisites() {
     [[ -f "${DEPLOY_DIR}/environment" ]] || die "Missing ${DEPLOY_DIR}/environment"
 }
 
+apt_has_candidate() {
+    local pkg="$1"
+    local candidate=""
+    candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/^[[:space:]]*Candidate:/ {print $2; exit}')"
+    [[ -n "$candidate" && "$candidate" != "(none)" ]]
+}
+
+run_apt_update() {
+    local update_log status
+    update_log="$(mktemp)"
+    set +e
+    apt-get update >"$update_log" 2>&1
+    status=$?
+    set -e
+    cat "$update_log"
+    if [[ "$status" -eq 0 ]]; then
+        rm -f "$update_log"
+        return 0
+    fi
+    # Raspberry Pi OS often warns that a target is configured multiple times.
+    # Those W: lines must not abort install, and this installer does not own
+    # /etc/apt — never rewrite the operator's sources to silence them.
+    if grep -Eqi 'configured multiple times|W: Target .* is configured' "$update_log"; then
+        warn "apt-get update reported duplicate APT sources (non-fatal); leaving existing sources unchanged"
+        rm -f "$update_log"
+        return 0
+    fi
+    rm -f "$update_log"
+    return "$status"
+}
+
+install_available_apt_packages() {
+    local pkg
+    local to_install=()
+    for pkg in "$@"; do
+        if apt_has_candidate "$pkg"; then
+            to_install+=("$pkg")
+        else
+            echo "Skipping unavailable package: ${pkg}"
+        fi
+    done
+    if [[ ${#to_install[@]} -gt 0 ]]; then
+        apt-get install -y "${to_install[@]}"
+    fi
+}
+
 install_apt_packages() {
     if [[ "$SKIP_APT" -eq 1 ]]; then
         return 0
     fi
     log "Installing system packages"
-    apt-get update
-    apt-get install -y \
-        python3 python3-pip python3-venv python3-dev \
-        python3-kms++ python3-libcamera python3-picamera2 \
-        libatlas-base-dev \
-        libcamera-dev libcamera-apps \
-        v4l-utils \
-        wget curl
+    export DEBIAN_FRONTEND=noninteractive
+    run_apt_update
+    apt-get install -y "${IDC_APT_REQUIRED[@]}"
+    install_available_apt_packages "${IDC_APT_CAMERA_CLI[@]}"
 }
 
 install_arducam() {

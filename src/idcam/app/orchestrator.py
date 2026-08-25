@@ -31,6 +31,7 @@ from idcam.exceptions import (
 from idcam.logging.setup import get_logger, set_log_context
 from idcam.network.api_client import ApiClient
 from idcam.network.protocol import UploadOutcome, UploadRequest
+from idcam.preview.live_viewer import LiveDebugViewer
 from idcam.storage.disk_monitor import DiskMonitor, StorageHealth
 from idcam.storage.paths import ensure_writable_directory
 from idcam.storage.temp_files import TempFileStore
@@ -90,6 +91,9 @@ class ApplicationOrchestrator:
         self._error_backoff_claimed = False
         self._capture_path: Path | None = None
         self._pending_response = None
+        self._debug_viewer: LiveDebugViewer | None = None
+        if config.debug.enabled:
+            self._debug_viewer = LiveDebugViewer(config.debug)
 
     @property
     def has_active_transaction(self) -> bool:
@@ -127,6 +131,9 @@ class ApplicationOrchestrator:
 
     async def _startup(self) -> None:
         self._transition(AppState.INITIALIZING)
+        if self._debug_viewer is not None:
+            self._debug_viewer.start()
+            self._publish_debug()
         ensure_writable_directory(self.config.temp_dir, "temp")
         removed = self.temp_store.cleanup_stale(self.config.storage.stale_temp_max_age_sec)
         if removed:
@@ -276,6 +283,7 @@ class ApplicationOrchestrator:
             return await asyncio.to_thread(self.camera.capture_preview_array)
         except CameraError as exc:
             logger.error("event=camera_preview_failed %s", exc)
+            self._publish_debug(camera_error=str(exc))
             await self._enter_recovery(str(exc))
             return None
 
@@ -284,7 +292,9 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return False
-        if self.detector.classify(frame) == DocumentPresence.DOCUMENT_MOVING:
+        moving = self.detector.classify(frame) == DocumentPresence.DOCUMENT_MOVING
+        self._publish_debug(frame)
+        if moving:
             logger.warning("event=document_moved_during_capture_phase state=%s", self.sm.state.value)
             await self._fail_transaction_and_wait("stability_timeout", "Document moved during capture")
             return False
@@ -299,7 +309,9 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return
-        if self.detector.detect(frame):
+        detected = self.detector.detect(frame)
+        self._publish_debug(frame)
+        if detected:
             logger.info("event=document_detected")
             self.stability.reset()
             self._begin_transaction()
@@ -328,14 +340,17 @@ class ApplicationOrchestrator:
         presence = self.detector.classify(frame)
         if presence == DocumentPresence.DOCUMENT_MOVING:
             self.stability.reset()
+            self._publish_debug(frame)
             self.sm.touch_progress()
             return
         if self.stability.update(frame):
+            self._publish_debug(frame)
             logger.info("event=document_stable frames=%d", self.stability.stable_count)
             assert self._transaction is not None
             self._transaction.phase = TransactionPhase.STABILIZING
             self._transition(AppState.FOCUSING)
         else:
+            self._publish_debug(frame)
             self.sm.touch_progress()
 
     async def _focusing_tick(self) -> None:
@@ -497,6 +512,7 @@ class ApplicationOrchestrator:
         else:
             self._removal_count = 0
             self.sm.touch_progress()
+        self._publish_debug(frame)
 
         if self._removal_count >= self.config.detection.removal_frames_required:
             logger.info(
@@ -665,6 +681,35 @@ class ApplicationOrchestrator:
             last_error=self.health.last_error,
             **self._health_status_kwargs(),
         )
+        self._publish_debug()
+
+    def _publish_debug(self, frame=None, *, camera_error: str | None = None) -> None:
+        """Push a debug snapshot. Never mutates ``frame``; the viewer copies it."""
+        viewer = self._debug_viewer
+        if viewer is None:
+            return
+        doc = self.detector.debug_info()
+        stab = self.stability.debug_info()
+        camera_healthy = self.health.camera.healthy and not camera_error
+        error_msg = camera_error
+        if not camera_healthy and error_msg is None:
+            error_msg = self.health.camera.message
+        viewer.publish(
+            frame,
+            state=self.sm.state.value,
+            document_detected=doc.detected,
+            motion=doc.motion,
+            edge_density=doc.edge_density,
+            motion_threshold=doc.motion_threshold,
+            edge_density_threshold=doc.edge_density_threshold,
+            stable_count=stab.stable_count,
+            stable_required=stab.stable_frames_required,
+            stable=stab.stable,
+            camera_healthy=camera_healthy,
+            autofocus_available=self.health.autofocus_available,
+            camera_error=error_msg,
+            roi_center_fraction=self.config.detection.roi_center_fraction,
+        )
 
     async def _shutdown(self) -> None:
         self._transition(AppState.SHUTDOWN)
@@ -672,6 +717,8 @@ class ApplicationOrchestrator:
         if self._transaction and not self._transaction.is_terminal:
             self._transaction.mark_failed("shutdown")
         self._clear_transaction()
+        if self._debug_viewer is not None:
+            self._debug_viewer.stop()
         await self.api.stop()
         await asyncio.to_thread(self.camera.shutdown)
         logger.info("Shutdown complete")

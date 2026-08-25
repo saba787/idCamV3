@@ -93,3 +93,69 @@ class TestConfigLoader:
         monkeypatch.setenv("IDCAM_ENV", "production")
         with pytest.raises(ConfigurationError, match="placeholder"):
             load_config(config_file)
+
+
+class TestDebugConfig:
+    def test_defaults_disabled(self, valid_config_dict):
+        config = AppConfig.model_validate(valid_config_dict)
+        assert config.debug.enabled is False
+        assert config.debug.host == "0.0.0.0"
+        assert config.debug.port == 8088
+        assert config.debug.fps == 5.0
+        assert config.debug.jpeg_quality == 70
+        assert config.debug.max_width == 1280
+        assert config.debug.overlay is True
+
+    def test_valid_debug_section(self, valid_config_dict):
+        valid_config_dict["debug"] = {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 8099,
+            "fps": 2.0,
+            "jpeg_quality": 60,
+            "max_width": 640,
+            "overlay": False,
+        }
+        config = AppConfig.model_validate(valid_config_dict)
+        assert config.debug.enabled is True
+        assert config.debug.port == 8099
+        assert config.debug.fps == 2.0
+
+    def test_port_bounds(self, valid_config_dict):
+        valid_config_dict["debug"] = {"port": 80}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+        valid_config_dict["debug"] = {"port": 70000}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+
+    def test_fps_and_quality_bounds(self, valid_config_dict):
+        valid_config_dict["debug"] = {"fps": 0}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+        valid_config_dict["debug"] = {"fps": 20}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+        valid_config_dict["debug"] = {"jpeg_quality": 10}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+        valid_config_dict["debug"] = {"jpeg_quality": 101}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+
+    def test_empty_host_rejected(self, valid_config_dict):
+        valid_config_dict["debug"] = {"host": "   "}
+        with pytest.raises(Exception):
+            AppConfig.model_validate(valid_config_dict)
+
+    def test_example_yaml_includes_disabled_debug(self, monkeypatch):
+        from pathlib import Path
+
+        monkeypatch.delenv("IDCAM_ENV", raising=False)
+        monkeypatch.delenv("IDCAM_DEVICE_ID", raising=False)
+        monkeypatch.delenv("IDCAM_SERVER_URL", raising=False)
+        monkeypatch.delenv("IDCAM_AUTH_TOKEN", raising=False)
+        path = Path(__file__).resolve().parents[2] / "config.example.yaml"
+        config = load_config(path)
+        assert config.debug.enabled is False
+        assert config.debug.port == 8088

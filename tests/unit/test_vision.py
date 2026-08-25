@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from idcam.config.schema import DetectionConfig
-from idcam.vision.document_detector import DocumentDetector
+from idcam.vision.document_detector import DocumentDetector, DocumentDetectionDebug
 from idcam.vision.sharpness import laplacian_variance, mean_brightness
 from idcam.vision.stability_detector import StabilityDetector
 
@@ -47,6 +47,35 @@ class TestDocumentDetector:
         assert detector.is_scene_empty(frame)
 
 
+class TestDocumentDetectionDebug:
+    def test_debug_values_match_detection_without_changing_result(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        baseline = np.full((480, 640, 3), 200, dtype=np.uint8)
+        detector.update_baseline(baseline)
+        frame = baseline.copy()
+        frame[100:380, 100:540] = 50
+        frame[100:120, 100:540] = 0
+        frame[360:380, 100:540] = 0
+        frame[100:380, 100:120] = 0
+        frame[100:380, 520:540] = 0
+        result = detector.detect(frame)
+        info = detector.debug_info()
+        assert isinstance(info, DocumentDetectionDebug)
+        assert result is True
+        assert info.detected is True
+        assert info.motion > info.motion_threshold
+        assert info.edge_density > info.edge_density_threshold
+        assert detector.detect(frame) is True
+
+    def test_debug_info_does_not_run_detection(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        before = detector.debug_info()
+        again = detector.debug_info()
+        assert before == again
+        assert before.detected is False
+        assert before.motion == 0.0
+
+
 class TestStabilityDetector:
     def test_not_stable_initially(self, detection_config):
         sd = StabilityDetector(detection_config)
@@ -70,6 +99,18 @@ class TestStabilityDetector:
         moving[200:300, 200:300] = 255
         sd.update(moving)
         assert sd.stable_count == 0
+
+    def test_stability_debug_info(self, detection_config):
+        sd = StabilityDetector(detection_config)
+        frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+        results = [sd.update(frame) for _ in range(10)]
+        info = sd.debug_info()
+        assert results[-1] is True
+        assert info.stable is True
+        assert info.stable_count == sd.stable_count
+        assert info.stable_frames_required == detection_config.stable_frames_required
+        assert info.threshold == detection_config.motion_threshold
+        assert sd.update(frame) is True
 
 
 class TestSharpness:

@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 
 from idcam.config.schema import DetectionConfig
+
+
+@dataclass(frozen=True)
+class StabilityDebug:
+    """Latest stability metrics for debug overlay. Does not affect stability."""
+
+    motion: float
+    threshold: float
+    stable_count: int
+    stable_frames_required: int
+    stable: bool
 
 
 class StabilityDetector:
@@ -15,10 +28,12 @@ class StabilityDetector:
         self.config = config
         self._stable_count = 0
         self._prev_gray: np.ndarray | None = None
+        self._last_motion = 0.0
 
     def reset(self) -> None:
         self._stable_count = 0
         self._prev_gray = None
+        self._last_motion = 0.0
 
     def _to_gray(self, frame: np.ndarray) -> np.ndarray:
         if frame.ndim == 3:
@@ -45,6 +60,7 @@ class StabilityDetector:
 
         diff = cv2.absdiff(gray, self._prev_gray)
         motion = float(np.mean(diff))
+        self._last_motion = motion
         self._prev_gray = gray
 
         if motion < self.config.motion_threshold:
@@ -57,3 +73,13 @@ class StabilityDetector:
     @property
     def stable_count(self) -> int:
         return self._stable_count
+
+    def debug_info(self) -> StabilityDebug:
+        """Return last computed metrics. Does not run stability or mutate state."""
+        return StabilityDebug(
+            motion=self._last_motion,
+            threshold=self.config.motion_threshold,
+            stable_count=self._stable_count,
+            stable_frames_required=self.config.stable_frames_required,
+            stable=self._stable_count >= self.config.stable_frames_required,
+        )

@@ -142,6 +142,32 @@ See `config.example.yaml`. Key settings:
 
 Environment overrides: `IDCAM_CONFIG`, `IDCAM_AUTH_TOKEN`, `IDCAM_DEVICE_ID`, `IDCAM_SERVER_URL`, `IDCAM_ENV`, `IDCAM_MOCK_CAMERA`.
 
+## Live Debug Viewer
+
+Optional development viewer. **Disabled by default** (`debug.enabled: false`). It is not required for capture.
+
+When enabled in `/etc/idcam/config.yaml`, the existing preview pipeline publishes the latest frame to a debug HTTP observer (no second camera):
+
+```yaml
+debug:
+  enabled: true
+  host: 0.0.0.0
+  port: 8088
+  fps: 5.0
+  jpeg_quality: 70
+  max_width: 1280
+  overlay: true
+```
+
+This exposes a live camera image over HTTP **without authentication**. Do not enable on untrusted networks. Restart the service after changing config:
+
+```bash
+sudo systemctl restart idcam
+hostname -I
+```
+
+Then open `http://<PI-IP>:8088/preview/live` (MJPEG: `/preview/live.mjpg`, JSON: `/preview/status`). Auth tokens are never shown.
+
 ## User Status
 
 The application writes real-time status to `/run/idcam/status.json`:

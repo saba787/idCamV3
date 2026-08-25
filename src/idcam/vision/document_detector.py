@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 import cv2
@@ -19,6 +20,19 @@ class DocumentPresence(str, Enum):
     DOCUMENT_MOVING = "document_moving"
     DOCUMENT_STABLE = "document_stable"
     DOCUMENT_READY = "document_ready"
+
+
+@dataclass(frozen=True)
+class DocumentDetectionDebug:
+    """Latest detector metrics for debug overlay. Does not affect detection."""
+
+    motion: float
+    edge_density: float
+    motion_threshold: float
+    edge_density_threshold: float
+    presence_frames: int
+    stable_frames_required: int
+    detected: bool
 
 
 class DocumentDetector:
@@ -43,6 +57,22 @@ class DocumentDetector:
     @property
     def last_edge_density(self) -> float:
         return self._last_edge_density
+
+    def debug_info(self) -> DocumentDetectionDebug:
+        """Return last computed metrics. Does not run detection or mutate state."""
+        detected = (
+            self._last_motion > self.config.motion_threshold
+            and self._last_edge_density > self.config.edge_density_threshold
+        )
+        return DocumentDetectionDebug(
+            motion=self._last_motion,
+            edge_density=self._last_edge_density,
+            motion_threshold=self.config.motion_threshold,
+            edge_density_threshold=self.config.edge_density_threshold,
+            presence_frames=self._presence_frames,
+            stable_frames_required=self.config.stable_frames_required,
+            detected=detected,
+        )
 
     def reset_baseline(self) -> None:
         self._baseline = None

@@ -95,6 +95,7 @@ Failure paths:
 | `camera/quality.py` | Post-capture validation (size, decode, dims) |
 | `vision/document_detector.py` | Scene change / document presence in ROI |
 | `vision/stability_detector.py` | Motion metric over consecutive frames |
+| `preview/live_viewer.py` | Optional debug MJPEG observer of the latest preview frame |
 | `vision/sharpness.py` | Laplacian variance on document region |
 | `network/api_client.py` | HTTPS upload, timeouts, error classification |
 | `network/protocol.py` | Request/response models, idempotency |
@@ -109,7 +110,7 @@ Failure paths:
 
 ## D. Data Flow
 
-1. **Preview loop** (IDLE): 5–10 FPS downscaled frame → document detector
+1. **Preview loop** (IDLE): 5–10 FPS downscaled frame → document detector (optional debug viewer observes this same frame; it never captures independently)
 2. **Detection**: frame diff + ROI edge density exceeds threshold → DOCUMENT_DETECTED
 3. **Stability**: N consecutive frames with motion < threshold → FOCUSING
 4. **Focus**: trigger `autofocus_cycle()` or AfTrigger; poll AfState; verify Laplacian variance
@@ -229,6 +230,8 @@ idCam/
 │   ├── document_detector.py
 │   ├── stability_detector.py
 │   └── sharpness.py
+├── preview/
+│   └── live_viewer.py
 ├── network/
 │   ├── api_client.py
 │   ├── protocol.py

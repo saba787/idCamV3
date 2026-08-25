@@ -36,6 +36,7 @@
 ## Attack Surface
 
 - No admin HTTP server exposed by default
+- The optional Live Debug Viewer (`debug.enabled`, default **false**) serves a live camera image over HTTP with **no authentication**. Leave it disabled in production. Do not expose `IDCAM_AUTH_TOKEN` or other credentials on that page (the viewer does not include them).
 - Status file is local JSON (readable by service user group)
 - No arbitrary command execution
 - No shell=True in subprocess calls

@@ -92,3 +92,14 @@ ui:
 watchdog:
   check_interval_sec: 1.0
   state_timeout_sec: 300
+
+# Live Debug Viewer — leave disabled in production.
+# Enabling exposes the live preview over HTTP with no authentication.
+debug:
+  enabled: false
+  host: 0.0.0.0
+  port: 8088
+  fps: 5.0
+  jpeg_quality: 70
+  max_width: 1280
+  overlay: true

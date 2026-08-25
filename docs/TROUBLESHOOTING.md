@@ -67,6 +67,20 @@ journalctl -u idcam --since "10 min ago"
 
 idCam auto-recovers up to `camera.recovery_max_attempts` times.
 
+### Live Debug Viewer
+
+The viewer is **off** unless `debug.enabled: true`. It does not create a second camera; it observes the existing 1920×1080 preview. After enabling and restarting:
+
+```bash
+sudo systemctl restart idcam
+sudo systemctl status idcam --no-pager
+hostname -I
+```
+
+Open `http://<PI-IP>:8088/preview/live`. Direct stream: `/preview/live.mjpg`. Diagnostics JSON: `/preview/status`.
+
+If the page says `WAITING FOR CAMERA...`, the service is still initializing. `CAMERA ERROR` means the preview path failed; check `journalctl -u idcam -n 100 --no-pager` and `/run/idcam/status.json`. Enabling this exposes the live image on the LAN with no login.
+
 ## Network
 
 ### Upload failures

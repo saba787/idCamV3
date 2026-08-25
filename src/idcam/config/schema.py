@@ -167,6 +167,26 @@ class WatchdogConfig(BaseModel):
     state_timeout_sec: float = Field(300.0, gt=0, le=3600)
 
 
+class DebugConfig(BaseModel):
+    """Optional Live Debug Viewer. Disabled by default — not required for capture."""
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = Field(8088, ge=1024, le=65535)
+    fps: float = Field(5.0, gt=0, le=15)
+    jpeg_quality: int = Field(70, ge=30, le=100)
+    max_width: int = Field(1280, ge=320, le=3840)
+    overlay: bool = True
+
+    @field_validator("host")
+    @classmethod
+    def strip_host(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("debug.host cannot be empty")
+        return stripped
+
+
 class AppConfig(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=128)
     temp_dir: Path = Path("/var/lib/idcam/tmp")
@@ -180,6 +200,7 @@ class AppConfig(BaseModel):
     logging: LoggingConfig = LoggingConfig()
     ui: UIConfig = UIConfig()
     watchdog: WatchdogConfig = WatchdogConfig()
+    debug: DebugConfig = DebugConfig()
 
     @field_validator("device_id")
     @classmethod

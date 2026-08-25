@@ -3,10 +3,9 @@
 import cv2
 import numpy as np
 import pytest
-import cv2
 
 from idcam.config.schema import DetectionConfig
-from idcam.vision.document_detector import DocumentDetector, DocumentDetectionDebug
+from idcam.vision.document_detector import DocumentDetector, DocumentDetectionDebug, DocumentPresence, gradient_edge_density
 from idcam.vision.sharpness import laplacian_variance, mean_brightness
 from idcam.vision.stability_detector import StabilityDetector
 
@@ -77,6 +76,59 @@ class TestDocumentDetectionDebug:
         assert before.detected is False
         assert before.motion == 0.0
 
+    def test_reject_reason_on_uniform_scene(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+        detector.detect(frame)
+        detector.detect(frame)
+        info = detector.debug_info()
+        assert info.detected is False
+        assert info.reject_reason
+        assert info.roi_width > 0
+        assert info.frame_width == 640
+
+    def test_rgb_preview_format_detects_document(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        baseline = np.zeros((240, 320, 3), dtype=np.uint8)
+        baseline[:] = (180, 40, 40)  # RGB red-ish empty scene
+        detector.update_baseline(baseline)
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        frame[:] = (40, 180, 40)
+        frame[20:220:4, :] = (10, 10, 10)
+        frame[:, 20:300:6] = (240, 240, 240)
+        assert detector.detect(frame)
+        info = detector.debug_info()
+        assert info.edge_density > info.edge_density_threshold
+        assert info.reject_reason == ""
+
+    def test_static_document_is_not_moving(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        empty = np.full((240, 320, 3), 200, dtype=np.uint8)
+        doc = empty.copy()
+        doc[40:200, 40:280] = 50
+        doc[40:50, 40:280] = 0
+        doc[190:200, 40:280] = 0
+        detector.update_baseline(empty)
+        first = detector.classify(doc)
+        assert first != DocumentPresence.NO_DOCUMENT
+        still = detector.classify(doc)
+        assert still != DocumentPresence.DOCUMENT_MOVING
+
+    def test_mild_defocus_has_gradient_edges(self, detection_config):
+        sharp = np.full((240, 320, 3), 200, dtype=np.uint8)
+        sharp[40:200, 40:280] = 40
+        for y in range(50, 190, 8):
+            sharp[y : y + 2, 50:270] = 0
+        mild = cv2.GaussianBlur(sharp, (9, 9), 0)
+        gray = cv2.cvtColor(mild, cv2.COLOR_RGB2GRAY)
+        canny = cv2.Canny(gray, 50, 150)
+        canny_density = float(np.count_nonzero(canny)) / canny.size
+        sobel_density = gradient_edge_density(gray)
+        assert sobel_density > canny_density
+        detector = DocumentDetector(detection_config)
+        detector.update_baseline(np.full((240, 320, 3), 180, dtype=np.uint8))
+        assert detector.detect(mild)
+
 
 class TestStabilityDetector:
     def test_not_stable_initially(self, detection_config):
@@ -128,17 +180,18 @@ class TestSharpness:
 
 
 class TestBlurKillsEdgeDensity:
-    def test_defocused_frame_has_near_zero_edges(self, detection_config):
-        detector = DocumentDetector(detection_config)
-        sharp = np.full((240, 320, 3), 200, dtype=np.uint8)
-        sharp[40:200, 40:280] = 40
-        sharp[40:50, 40:280] = 0
-        sharp[190:200, 40:280] = 0
-        detector.update_baseline(np.full((240, 320, 3), 180, dtype=np.uint8))
-        detector.classify(sharp)
-        sharp_edges = detector.last_edge_density
-        blurry = cv2.GaussianBlur(sharp, (31, 31), 0)
-        detector.classify(blurry)
-        assert sharp_edges > detection_config.edge_density_threshold
-        assert detector.last_edge_density < sharp_edges
+    def test_heavy_blur_reduces_textured_edge_density(self):
+        """Sobel density of a printed card drops under heavy defocus; a solid
+        rectangle's outline can *spread* after Gaussian blur, so this uses texture."""
+        h, w = 240, 320
+        yy, xx = np.indices((h, w))
+        checker = np.where(((xx // 8) + (yy // 8)) % 2 == 0, 220, 40).astype(np.uint8)
+        textured = np.stack([checker, checker, checker], axis=-1)
+        frame = np.full((h, w, 3), 30, dtype=np.uint8)
+        frame[40:200, 40:280] = textured[40:200, 40:280]
+        blurred = cv2.GaussianBlur(frame, (51, 51), 18)
+        sharp = gradient_edge_density(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY))
+        blur = gradient_edge_density(cv2.cvtColor(blurred, cv2.COLOR_RGB2GRAY))
+        assert sharp > 0.15
+        assert blur < sharp * 0.25
 

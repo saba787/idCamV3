@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -92,8 +93,16 @@ class ApplicationOrchestrator:
         self._capture_path: Path | None = None
         self._pending_response = None
         self._debug_viewer: LiveDebugViewer | None = None
+        self._idle_reject_count = 0
+        self._cmd_lock = threading.Lock()
+        self._pending_command: str | None = None
+        self._command_result: dict | None = None
+        self._command_event = threading.Event()
+        self._manual_phase = "idle"
+        self._manual_message = ""
         if config.debug.enabled:
             self._debug_viewer = LiveDebugViewer(config.debug)
+            self._debug_viewer.set_capture_handler(self.request_manual_capture)
 
     @property
     def has_active_transaction(self) -> bool:
@@ -220,6 +229,7 @@ class ApplicationOrchestrator:
         )
         if state == AppState.DOCUMENT_DETECTED:
             self._abort_transaction("document_detected_timeout")
+            self._clear_transaction()
             self._transition(AppState.IDLE, reason="document_detected_timeout")
             return True
         if state == AppState.WAITING_FOR_STABILITY:
@@ -309,24 +319,136 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return
+        if self._take_manual_request():
+            logger.info("event=pipeline_stage stage=manual_capture_start state=IDLE")
+            self.stability.reset()
+            self._begin_transaction(trigger="manual")
+            self._set_manual_phase("detected", "Manual capture started")
+            self._publish_debug(frame)
+            self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
+            return
         detected = self.detector.detect(frame)
         self._publish_debug(frame)
         if detected:
-            logger.info("event=document_detected")
+            logger.info(
+                "event=document_detected motion=%.2f edge_density=%.4f",
+                self.detector.last_motion,
+                self.detector.last_edge_density,
+            )
+            logger.info("event=pipeline_stage stage=document_detected")
             self.stability.reset()
-            self._begin_transaction()
+            self._begin_transaction(trigger="auto")
             self._transition(AppState.DOCUMENT_DETECTED)
+        else:
+            self._idle_reject_count += 1
+            if self._idle_reject_count == 1 or self._idle_reject_count % 50 == 0:
+                info = self.detector.debug_info()
+                logger.info(
+                    "event=idle_no_document frames=%d motion=%.2f frame_motion=%.2f "
+                    "edge_density=%.4f reason=%s roi=%dx%d frame=%dx%d gray_std=%.1f",
+                    self._idle_reject_count,
+                    info.motion,
+                    info.frame_motion,
+                    info.edge_density,
+                    info.reject_reason,
+                    info.roi_width,
+                    info.roi_height,
+                    info.frame_width,
+                    info.frame_height,
+                    info.gray_std,
+                )
 
-    def _begin_transaction(self) -> ActiveCaptureTransaction:
+    def _begin_transaction(self, *, trigger: str = "auto") -> ActiveCaptureTransaction:
         if self._transaction is not None and not self._transaction.is_terminal:
             raise RuntimeError("Cannot begin transaction: one already active")
-        txn = ActiveCaptureTransaction(capture_id=ActiveCaptureTransaction.generate_id())
+        with self._cmd_lock:
+            if self._pending_command == "manual_capture":
+                self._pending_command = "manual_capture_running"
+                trigger = "manual"
+                self._manual_phase = "starting"
+                self._manual_message = "Manual capture started"
+        txn = ActiveCaptureTransaction(capture_id=ActiveCaptureTransaction.generate_id(), trigger=trigger)
         txn.mark_document_detected()
         self._transaction = txn
         self._capture_path = None
+        self._idle_reject_count = 0
         set_log_context(capture_id=txn.capture_id)
-        logger.info("event=transaction_started capture_id=%s", txn.capture_id)
+        logger.info("event=transaction_started capture_id=%s trigger=%s", txn.capture_id, trigger)
         return txn
+
+    def request_manual_capture(self, timeout: float = 180.0) -> dict:
+        """HTTP-thread entry: queue a capture through the existing state machine."""
+        state = self.sm.state
+        txn_active = self._transaction is not None and not self._transaction.is_terminal
+        if state != AppState.IDLE or self.has_active_transaction or txn_active:
+            logger.info("event=manual_capture_rejected status=busy state=%s", state.value)
+            return {
+                "ok": False,
+                "status": "busy",
+                "state": state.value,
+                "message": f"Busy ({state.value})",
+            }
+        with self._cmd_lock:
+            if self._pending_command is not None:
+                return {
+                    "ok": False,
+                    "status": "busy",
+                    "state": state.value,
+                    "message": "Capture already in progress",
+                }
+            self._pending_command = "manual_capture"
+            self._command_result = None
+            self._command_event.clear()
+            self._manual_phase = "queued"
+            self._manual_message = "Waiting for capture pipeline"
+        logger.info("event=pipeline_stage stage=manual_capture_queued")
+        if not self._command_event.wait(timeout):
+            with self._cmd_lock:
+                if self._pending_command == "manual_capture":
+                    self._pending_command = None
+                self._manual_phase = "timeout"
+                self._manual_message = "Timed out waiting for capture"
+            logger.warning("event=manual_capture_timeout")
+            return {"ok": False, "status": "timeout", "message": "Timed out waiting for capture"}
+        with self._cmd_lock:
+            result = dict(self._command_result or {"ok": False, "status": "error", "message": "No result"})
+        return result
+
+    def _take_manual_request(self) -> bool:
+        with self._cmd_lock:
+            if self._pending_command == "manual_capture":
+                self._pending_command = "manual_capture_running"
+                self._manual_phase = "starting"
+                return True
+            return False
+
+    def _set_manual_phase(self, phase: str, message: str = "") -> None:
+        with self._cmd_lock:
+            if self._pending_command in {"manual_capture", "manual_capture_running"}:
+                self._manual_phase = phase
+                if message:
+                    self._manual_message = message
+
+    def _finish_manual_request(self, result: dict) -> None:
+        with self._cmd_lock:
+            if self._pending_command not in {"manual_capture", "manual_capture_running"}:
+                return
+            self._command_result = result
+            self._pending_command = None
+            self._manual_phase = "success" if result.get("ok") else "failed"
+            self._manual_message = str(result.get("message") or "")
+            self._command_event.set()
+
+    def _manual_status(self) -> tuple[bool, str, str]:
+        with self._cmd_lock:
+            available = (
+                self.sm.state == AppState.IDLE
+                and not self.has_active_transaction
+                and (self._transaction is None or self._transaction.is_terminal)
+                and self._pending_command is None
+                and self.health.camera.healthy
+            )
+            return available, self._manual_phase, self._manual_message
 
     async def _document_detected_tick(self) -> None:
         if not self._claim_state_action():
@@ -348,6 +470,8 @@ class ApplicationOrchestrator:
             logger.info("event=document_stable frames=%d", self.stability.stable_count)
             assert self._transaction is not None
             self._transaction.phase = TransactionPhase.STABILIZING
+            logger.info("event=pipeline_stage stage=focusing reason=document_stable")
+            self._set_manual_phase("focusing", "Focusing...")
             self._transition(AppState.FOCUSING)
         else:
             self._publish_debug(frame)
@@ -363,6 +487,8 @@ class ApplicationOrchestrator:
             return
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
+        self._set_manual_phase("focusing", "Focusing...")
+        logger.info("event=pipeline_stage stage=focusing capture_id=%s", self._transaction.capture_id)
         min_sharp = self.config.quality.min_sharpness * 0.6
         try:
             result = await self.autofocus.run_autofocus(
@@ -370,8 +496,16 @@ class ApplicationOrchestrator:
                 sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
             )
+            pause = getattr(self.camera, "pause_autofocus", None)
+            if callable(pause):
+                await asyncio.to_thread(pause)
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
+            logger.info(
+                "event=pipeline_stage stage=focus_verification method=%s sharpness=%.1f",
+                result.method,
+                result.sharpness,
+            )
             self._transition(AppState.FOCUS_VERIFICATION)
         except AutofocusError as exc:
             logger.error("event=autofocus_failed %s", exc)
@@ -411,6 +545,8 @@ class ApplicationOrchestrator:
             return
         output_path = self.temp_store.create_temp_path()
         self._transaction.mark_capture_started(str(output_path))
+        self._set_manual_phase("capturing", "Capturing...")
+        logger.info("event=pipeline_stage stage=capturing path=%s", output_path)
         try:
             self._capture_path = await self.capture_service.capture(self.camera, output_path)
             self.sm.touch_progress()
@@ -425,6 +561,8 @@ class ApplicationOrchestrator:
             return
         assert self._transaction is not None
         assert self._capture_path is not None
+        self._set_manual_phase("validating", "Validating image...")
+        logger.info("event=pipeline_stage stage=image_validation path=%s", self._capture_path)
         try:
             result = self.validator.validate(self._capture_path)
             self._transaction.mark_validated(
@@ -452,6 +590,12 @@ class ApplicationOrchestrator:
         assert self._transaction is not None
         assert self._capture_path is not None
         self._transaction.mark_upload_started()
+        self._set_manual_phase("uploading", "Uploading...")
+        logger.info(
+            "event=pipeline_stage stage=uploading capture_id=%s path=%s",
+            self._transaction.capture_id,
+            self._capture_path,
+        )
         request = UploadRequest(
             capture_id=self._transaction.capture_id,
             device_id=self.config.device_id,
@@ -481,11 +625,28 @@ class ApplicationOrchestrator:
             return
         assert self._transaction is not None
         response = self._pending_response
+        logger.info(
+            "event=pipeline_stage stage=server_response success=%s outcome=%s http_status=%s capture_id=%s",
+            bool(response and response.success),
+            response.outcome.value if response else "none",
+            response.http_status if response else None,
+            self._transaction.capture_id,
+        )
         if response and response.success and response.outcome == UploadOutcome.ACCEPTED:
             self.health.record_success()
             self.health.server = ComponentStatus(level=HealthLevel.HEALTHY, details={"healthy": True, "reachable": True})
             self._transaction.mark_completed()
             self.temp_store.cleanup(self._capture_path)
+            logger.info("event=pipeline_stage stage=success capture_id=%s", self._transaction.capture_id)
+            self._finish_manual_request(
+                {
+                    "ok": True,
+                    "status": "success",
+                    "state": AppState.SUCCESS.value,
+                    "capture_id": self._transaction.capture_id,
+                    "message": "Upload accepted",
+                }
+            )
             self._transition(AppState.SUCCESS)
         else:
             msg = response.message if response else "Upload failed"
@@ -591,6 +752,15 @@ class ApplicationOrchestrator:
         self._cleanup_transaction_files()
         if self._transaction and not self._transaction.is_terminal:
             self._transaction.mark_failed(reason)
+        self._finish_manual_request(
+            {
+                "ok": False,
+                "status": "failed",
+                "state": "RECOVERY",
+                "capture_id": getattr(self._transaction, "capture_id", None),
+                "message": reason,
+            }
+        )
         self._next_recovery_at = 0.0
         self._state_action_claimed = None
         self._transition(AppState.RECOVERY, reason=reason)
@@ -598,6 +768,15 @@ class ApplicationOrchestrator:
     def _abort_transaction(self, reason: str) -> None:
         if self._transaction and not self._transaction.is_terminal:
             self._transaction.mark_failed(reason)
+        self._finish_manual_request(
+            {
+                "ok": False,
+                "status": "failed",
+                "state": self.sm.state.value,
+                "capture_id": self._transaction.capture_id if self._transaction else None,
+                "message": reason,
+            }
+        )
         self._cleanup_transaction_files()
 
     async def _fail_transaction_and_wait(self, failure_key: str, detail: str) -> None:
@@ -611,6 +790,21 @@ class ApplicationOrchestrator:
             failure_key=failure_key,
             last_error=detail,
             **self._health_status_kwargs(),
+        )
+        logger.info(
+            "event=pipeline_stage stage=failed reason=%s detail=%s capture_id=%s",
+            failure_key,
+            detail,
+            self._transaction.capture_id if self._transaction else None,
+        )
+        self._finish_manual_request(
+            {
+                "ok": False,
+                "status": "failed",
+                "state": AppState.WAITING_FOR_REMOVAL.value,
+                "capture_id": self._transaction.capture_id if self._transaction else None,
+                "message": f"{failure_key}: {detail}",
+            }
         )
         self._transition(AppState.WAITING_FOR_REMOVAL)
 
@@ -694,6 +888,7 @@ class ApplicationOrchestrator:
         error_msg = camera_error
         if not camera_healthy and error_msg is None:
             error_msg = self.health.camera.message
+        available, phase, message = self._manual_status()
         viewer.publish(
             frame,
             state=self.sm.state.value,
@@ -709,6 +904,17 @@ class ApplicationOrchestrator:
             autofocus_available=self.health.autofocus_available,
             camera_error=error_msg,
             roi_center_fraction=self.config.detection.roi_center_fraction,
+            reject_reason=doc.reject_reason,
+            roi_width=doc.roi_width,
+            roi_height=doc.roi_height,
+            gray_std=doc.gray_std,
+            gray_mean=doc.gray_mean,
+            frame_width=doc.frame_width,
+            frame_height=doc.frame_height,
+            frame_motion=doc.frame_motion,
+            manual_capture_available=available,
+            manual_phase=phase,
+            manual_message=message,
         )
 
     async def _shutdown(self) -> None:
@@ -716,6 +922,14 @@ class ApplicationOrchestrator:
         self._cleanup_transaction_files()
         if self._transaction and not self._transaction.is_terminal:
             self._transaction.mark_failed("shutdown")
+        self._finish_manual_request(
+            {
+                "ok": False,
+                "status": "failed",
+                "state": "SHUTDOWN",
+                "message": "Service shutting down",
+            }
+        )
         self._clear_transaction()
         if self._debug_viewer is not None:
             self._debug_viewer.stop()

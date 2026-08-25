@@ -51,6 +51,17 @@ class DebugSnapshot:
     camera_error: str | None = None
     roi_center_fraction: float = 0.7
     waiting_for_camera: bool = True
+    reject_reason: str = ""
+    roi_width: int = 0
+    roi_height: int = 0
+    gray_std: float = 0.0
+    gray_mean: float = 0.0
+    frame_width: int = 0
+    frame_height: int = 0
+    frame_motion: float = 0.0
+    manual_capture_available: bool = False
+    manual_phase: str = "idle"
+    manual_message: str = ""
 
 
 class LiveFrameBuffer:
@@ -189,6 +200,10 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         f"MOTION THRESHOLD: {snapshot.motion_threshold:.2f}",
         f"EDGE: {snapshot.edge_density:.4f}",
         f"EDGE THRESHOLD: {snapshot.edge_density_threshold:.4f}",
+        f"REJECT: {snapshot.reject_reason or '-'}",
+        f"ROI: {snapshot.roi_width}x{snapshot.roi_height}",
+        f"FRAME: {snapshot.frame_width}x{snapshot.frame_height}",
+        f"FRAME MOTION: {snapshot.frame_motion:.2f}",
         f"STABLE: {snapshot.stable_count}/{snapshot.stable_required}",
         f"FPS: {fps:.1f}",
         f"CAMERA: {camera}",
@@ -233,6 +248,15 @@ _HTML_PAGE = """<!DOCTYPE html>
     dl { margin: 0; }
     dt { color: #888; font-size: 0.75rem; text-transform: uppercase; margin-top: 12px; }
     dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; font-size: 1.05rem; }
+    button {
+      margin-top: 16px; width: 100%; padding: 12px 16px; font-size: 1rem;
+      font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
+      background: #3b82f6; color: #fff;
+    }
+    button:disabled { background: #334155; color: #94a3b8; cursor: not-allowed; }
+    .manual { margin-top: 8px; font-size: 0.9rem; color: #ddd; min-height: 2.4em; }
+    .manual.error { color: #f87171; }
+    .manual.ok { color: #4ade80; }
     @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -250,16 +274,42 @@ _HTML_PAGE = """<!DOCTYPE html>
         <dt>State</dt><dd id="state">—</dd>
         <dt>Camera</dt><dd id="camera">—</dd>
         <dt>Detection</dt><dd id="detection">—</dd>
+        <dt>Reject reason</dt><dd id="reject">—</dd>
         <dt>Motion</dt><dd id="motion">—</dd>
+        <dt>Frame motion</dt><dd id="framemotion">—</dd>
         <dt>Edge density</dt><dd id="edge">—</dd>
+        <dt>ROI</dt><dd id="roi">—</dd>
+        <dt>Frame</dt><dd id="frame">—</dd>
+        <dt>Gray std</dt><dd id="graystd">—</dd>
         <dt>Stable frames</dt><dd id="stable">—</dd>
         <dt>FPS</dt><dd id="fps">—</dd>
         <dt>Timestamp</dt><dd id="timestamp">—</dd>
       </dl>
+      <button id="capture" type="button">Capture &amp; Send</button>
+      <div id="manual" class="manual">Idle</div>
     </aside>
   </main>
   <script>
     const el = (id) => document.getElementById(id);
+    let capturing = false;
+    function phaseLabel(d) {
+      const phase = d.manual_phase || "";
+      const map = {
+        queued: "Queued...",
+        starting: "Starting...",
+        detected: "Document detected...",
+        focusing: "Focusing...",
+        capturing: "Capturing...",
+        validating: "Validating...",
+        uploading: "Uploading...",
+        success: "Success",
+        failed: "Failure",
+        timeout: "Timed out",
+        busy: "Busy",
+        idle: "Idle"
+      };
+      return map[phase] || phase || "Idle";
+    }
     async function refresh() {
       try {
         const r = await fetch("/preview/status", { cache: "no-store" });
@@ -268,16 +318,61 @@ _HTML_PAGE = """<!DOCTYPE html>
         el("state").textContent = d.state || "—";
         el("camera").textContent = d.camera_healthy ? "healthy" : "unhealthy";
         el("detection").textContent = d.document_detected ? "detected" : "not detected";
+        el("reject").textContent = d.reject_reason || "—";
         el("motion").textContent = Number(d.motion).toFixed(2);
+        el("framemotion").textContent = Number(d.frame_motion || 0).toFixed(2);
         el("edge").textContent = Number(d.edge_density).toFixed(4);
+        el("roi").textContent = (d.roi_width || 0) + " x " + (d.roi_height || 0);
+        const fr = d.frame || {};
+        const shape = fr.shape ? fr.shape.join("x") : ((d.frame_width || "—") + "x" + (d.frame_height || "—"));
+        el("frame").textContent = shape + " " + (fr.dtype || "") + " " + (fr.channel_order || "");
+        el("graystd").textContent = Number(d.gray_std || 0).toFixed(2);
         el("stable").textContent = (d.stable_count ?? 0) + " / " + (d.stable_required ?? 0);
         el("fps").textContent = Number(d.fps).toFixed(1);
         const ts = d.timestamp ? new Date(d.timestamp * 1000).toISOString() : "—";
         el("timestamp").textContent = ts;
+        const btn = el("capture");
+        btn.disabled = capturing || d.manual_capture_available === false;
+        const box = el("manual");
+        const live = d.manual_message || phaseLabel(d);
+        if (capturing) {
+          if (live && live !== "Idle") box.textContent = live;
+        } else {
+          box.textContent = live;
+          box.className = "manual" + (d.manual_phase === "failed" ? " error" : d.manual_phase === "success" ? " ok" : "");
+        }
       } catch (err) {
         el("camera").textContent = "unhealthy";
       }
     }
+    el("capture").addEventListener("click", async () => {
+      if (capturing) return;
+      capturing = true;
+      const btn = el("capture");
+      const box = el("manual");
+      btn.disabled = true;
+      box.className = "manual";
+      box.textContent = "Queued...";
+      const poll = setInterval(refresh, 300);
+      try {
+        const r = await fetch("/preview/capture", { method: "POST", cache: "no-store" });
+        const d = await r.json();
+        if (d.ok) {
+          box.className = "manual ok";
+          box.textContent = "Success" + (d.capture_id ? " (" + d.capture_id + ")" : "");
+        } else {
+          box.className = "manual error";
+          box.textContent = (d.status === "busy" ? "Busy" : "Failure") + ": " + (d.message || "unknown error");
+        }
+      } catch (err) {
+        box.className = "manual error";
+        box.textContent = "Failure: request failed";
+      } finally {
+        clearInterval(poll);
+        capturing = false;
+        refresh();
+      }
+    });
     refresh();
     setInterval(refresh, 500);
   </script>
@@ -303,6 +398,63 @@ def _make_handler(viewer: LiveDebugViewer) -> type[BaseHTTPRequestHandler]:
                 self._serve_status()
             else:
                 self.send_error(404, "Not Found")
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if path == "/preview/capture":
+                self._serve_capture()
+            else:
+                self.send_error(404, "Not Found")
+
+        def _json_bytes(self, payload: dict[str, Any], status: int = 200) -> None:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _serve_capture(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 0:
+                remaining = min(length, 65536)
+                self.rfile.read(remaining)
+            handler = viewer.capture_handler
+            if handler is None:
+                self._json_bytes(
+                    {"ok": False, "status": "unavailable", "message": "Manual capture is not attached"},
+                    503,
+                )
+                return
+            try:
+                result = handler()
+            except Exception:
+                logger.exception("event=debug_manual_capture_failed")
+                self._json_bytes(
+                    {"ok": False, "status": "error", "message": "Capture request failed"},
+                    500,
+                )
+                return
+            if not isinstance(result, dict):
+                self._json_bytes({"ok": False, "status": "error", "message": "Invalid capture result"}, 500)
+                return
+            safe = {
+                "ok": bool(result.get("ok")),
+                "status": str(result.get("status") or ""),
+                "state": str(result.get("state") or ""),
+                "message": str(result.get("message") or ""),
+            }
+            if result.get("capture_id"):
+                safe["capture_id"] = str(result["capture_id"])
+            code = 200
+            if safe["status"] == "busy":
+                code = 409
+            elif safe["status"] == "timeout":
+                code = 504
+            elif not safe["ok"] and safe["status"] not in {"failed"}:
+                code = 500
+            self._json_bytes(safe, code)
 
         def _serve_html(self) -> None:
             body = _HTML_PAGE.encode("utf-8")
@@ -383,10 +535,18 @@ class LiveDebugViewer:
         self._started = False
         self._frame_info: dict[str, Any] | None = None
         self._logged_encode_format = False
+        self._capture_handler: Any = None
 
     @property
     def is_running(self) -> bool:
         return self._started and not self._stop.is_set()
+
+    @property
+    def capture_handler(self) -> Any:
+        return self._capture_handler
+
+    def set_capture_handler(self, handler: Any) -> None:
+        self._capture_handler = handler
 
     def start(self) -> None:
         if self._started:
@@ -469,6 +629,17 @@ class LiveDebugViewer:
         autofocus_available: bool,
         camera_error: str | None = None,
         roi_center_fraction: float = 0.7,
+        reject_reason: str = "",
+        roi_width: int = 0,
+        roi_height: int = 0,
+        gray_std: float = 0.0,
+        gray_mean: float = 0.0,
+        frame_width: int = 0,
+        frame_height: int = 0,
+        frame_motion: float = 0.0,
+        manual_capture_available: bool = False,
+        manual_phase: str = "idle",
+        manual_message: str = "",
     ) -> None:
         """Store the latest preview copy and metadata. Never blocks on HTTP clients."""
         with self._meta_lock:
@@ -498,6 +669,17 @@ class LiveDebugViewer:
                 camera_error=camera_error,
                 roi_center_fraction=roi_center_fraction,
                 waiting_for_camera=self._latest_frame is None,
+                reject_reason=reject_reason,
+                roi_width=roi_width,
+                roi_height=roi_height,
+                gray_std=gray_std,
+                gray_mean=gray_mean,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                frame_motion=frame_motion,
+                manual_capture_available=manual_capture_available,
+                manual_phase=manual_phase,
+                manual_message=manual_message,
             )
 
     def snapshot_meta(self) -> DebugSnapshot:
@@ -530,6 +712,17 @@ class LiveDebugViewer:
             "fps": round(self._actual_fps or self.config.fps, 2),
             "timestamp": snap.timestamp,
             "frame": frame_info,
+            "reject_reason": snap.reject_reason,
+            "roi_width": snap.roi_width,
+            "roi_height": snap.roi_height,
+            "gray_std": snap.gray_std,
+            "gray_mean": snap.gray_mean,
+            "frame_width": snap.frame_width,
+            "frame_height": snap.frame_height,
+            "frame_motion": snap.frame_motion,
+            "manual_capture_available": snap.manual_capture_available,
+            "manual_phase": snap.manual_phase,
+            "manual_message": snap.manual_message,
         }
 
     def wait_jpeg(self, last_seq: int, timeout: float) -> tuple[int, bytes | None]:

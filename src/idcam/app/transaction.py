@@ -53,6 +53,7 @@ class ActiveCaptureTransaction:
     phase: TransactionPhase = TransactionPhase.CANDIDATE
     focus_attempts: int = 0
     focus_verify_attempts: int = 0
+    trigger: str = "auto"
 
     @staticmethod
     def generate_id() -> str:
@@ -120,6 +121,7 @@ class ActiveCaptureTransaction:
             "image_size": self.image_size,
             "image_sha256": self.image_sha256,
             "failure_reason": self.failure_reason,
+            "trigger": self.trigger,
         }
 
     @property

@@ -127,7 +127,7 @@ class CameraManager:
                     self.config.capture_height,
                 )
                 try:
-                    self._enable_preview_autofocus(wait=True)
+                    self._enable_preview_autofocus(wait=False)
                 except Exception as exc:
                     logger.warning("event=autofocus_preview_failed error=%s", exc)
             except Exception as exc:
@@ -250,11 +250,27 @@ class CameraManager:
                 time.sleep(0.2)
                 return True
             assert self._picam2 is not None
+            self.set_controls({"AfSpeed": self._af_speed_fast()})
             if hasattr(self._picam2, "autofocus_cycle"):
                 result = self._picam2.autofocus_cycle()
                 return True if result is None else bool(result)
             self.set_controls({"AfMode": self._af_mode_auto(), "AfTrigger": self._af_trigger_start()})
             return True
+
+    def pause_autofocus(self) -> None:
+        """Lock the current lens position so Continuous AF does not hunt during still capture."""
+        with self._lock:
+            if self._use_mock or self._picam2 is None:
+                return
+            advertised = self._picam2.camera_controls
+            if "AfPause" in advertised:
+                self.set_controls({"AfPause": 0})
+                logger.info("event=autofocus_triggered method=pause")
+            elif "AfMode" in advertised and "LensPosition" in advertised:
+                lens = self._read_lens_position()
+                if lens is not None:
+                    self.set_controls({"AfMode": self._af_mode_manual(), "LensPosition": lens})
+                    logger.info("event=autofocus_result method=hold_lens_position lens_position=%s", lens)
 
     def _af_enum(self, group: str, name: str, fallback: int) -> int:
         if controls is None:
@@ -276,6 +292,9 @@ class CameraManager:
 
     def _af_trigger_start(self) -> int:
         return self._af_enum("AfTriggerEnum", "Start", _AF_TRIGGER_START)
+
+    def _af_speed_fast(self) -> int:
+        return self._af_enum("AfSpeedEnum", "Fast", 1)
 
     def _af_mode_max(self) -> int | None:
         if self._picam2 is None:
@@ -315,11 +334,17 @@ class CameraManager:
         continuous = self._af_mode_continuous()
         max_mode = self._af_mode_max()
         if max_mode is not None and max_mode >= continuous:
-            self.set_controls({"AfMode": continuous})
+            self.set_controls({"AfMode": continuous, "AfSpeed": self._af_speed_fast()})
             mode_name = "Continuous"
-            logger.info("event=autofocus_triggered mode=%s", mode_name)
+            logger.info("event=autofocus_triggered mode=%s speed=Fast", mode_name)
         else:
-            self.set_controls({"AfMode": self._af_mode_auto(), "AfTrigger": self._af_trigger_start()})
+            self.set_controls(
+                {
+                    "AfMode": self._af_mode_auto(),
+                    "AfTrigger": self._af_trigger_start(),
+                    "AfSpeed": self._af_speed_fast(),
+                }
+            )
             mode_name = "Auto"
             logger.info("event=autofocus_triggered mode=%s trigger=Start", mode_name)
         self._preview_af_mode = mode_name

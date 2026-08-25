@@ -6,6 +6,7 @@ import json
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.client import HTTPResponse
 
@@ -214,6 +215,7 @@ class TestDebugHttp:
         assert "motion" in payload
         assert "edge_density" in payload
         assert "stable_count" in payload
+        assert "reject_reason" in payload
         assert payload["frame"]["channel_order"] == "RGB"
         assert payload["frame"]["shape"] == [80, 120, 3]
 
@@ -223,6 +225,7 @@ class TestDebugHttp:
             body = resp.read().decode("utf-8")
         assert "idCam V3 — Live Debug Viewer" in body
         assert "/preview/live.mjpg" in body
+        assert "Capture &amp; Send" in body
         assert "IDCAM_AUTH_TOKEN" not in body
         assert "Bearer" not in body
 
@@ -328,6 +331,48 @@ class TestDebugHttp:
         assert r_mean > b_mean
         assert r_mean > g_mean
         assert r_mean > 150
+
+    def test_capture_post_unavailable_without_handler(self, debug_viewer):
+        url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/capture"
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(req, timeout=3)
+        assert excinfo.value.code == 503
+
+    def test_capture_post_busy(self, debug_viewer):
+        debug_viewer.set_capture_handler(
+            lambda: {"ok": False, "status": "busy", "state": "FOCUSING", "message": "Busy (FOCUSING)"}
+        )
+        url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/capture"
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(req, timeout=3)
+        assert excinfo.value.code == 409
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["status"] == "busy"
+        assert "Bearer" not in json.dumps(payload)
+
+    def test_capture_post_success_strips_unknown_fields(self, debug_viewer):
+        debug_viewer.set_capture_handler(
+            lambda: {
+                "ok": True,
+                "status": "success",
+                "capture_id": "cap-1",
+                "message": "Upload accepted",
+                "token": "SECRET",
+                "Authorization": "Bearer SECRET",
+            }
+        )
+        url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/capture"
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["ok"] is True
+        assert payload["capture_id"] == "cap-1"
+        dumped = json.dumps(payload)
+        assert "SECRET" not in dumped
+        assert "Bearer" not in dumped
+        assert "token" not in payload
 
 
 class TestDetectorFrameIsolation:

@@ -78,8 +78,7 @@ class TestTransactionOrphan:
         handled = await orch._handle_state_timeout()
         assert handled
         assert orch.sm.state == AppState.IDLE
-        assert orch._transaction.is_terminal
-        assert orch._transaction.failure_reason == "document_detected_timeout"
+        assert orch._transaction is None
 
 
 class TestOneShotStates:

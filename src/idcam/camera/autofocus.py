@@ -117,16 +117,35 @@ class AutofocusController:
                 self.capabilities.degraded,
             )
             try:
-                last_af_state = await self._run_hardware_af(camera, attempt)
+                preview, last_sharpness, last_af_state, lens = await self._measure_focus(
+                    camera, roi_fraction
+                )
+                already_good = last_sharpness >= sharpness_threshold
+                if already_good and attempt == 1:
+                    logger.info(
+                        "event=autofocus_result success=true method=already_sharp "
+                        "sharpness=%.1f min_required=%.1f attempt=%d lens_position=%s af_state=%s",
+                        last_sharpness,
+                        sharpness_threshold,
+                        attempt,
+                        lens,
+                        last_af_state,
+                    )
+                    return AutofocusResult(
+                        success=True,
+                        sharpness=last_sharpness,
+                        attempts=attempt,
+                        af_state=last_af_state,
+                        method="already_sharp",
+                        min_required_sharpness=sharpness_threshold,
+                    )
 
-                preview = await asyncio.to_thread(camera.capture_preview_array)
-                if preview is None or getattr(preview, "size", 1) == 0:
-                    raise AutofocusError("Invalid preview frame for sharpness check")
-                last_sharpness = laplacian_variance(preview, roi_fraction)
-                meta = self._read_metadata(camera)
-                lens = meta.get("LensPosition")
-                if last_af_state is None and "AfState" in meta:
-                    last_af_state = int(meta["AfState"])
+                last_af_state = await self._run_hardware_af(camera, attempt)
+                preview, last_sharpness, measured_state, lens = await self._measure_focus(
+                    camera, roi_fraction
+                )
+                if last_af_state is None:
+                    last_af_state = measured_state
                 logger.info(
                     "event=autofocus_result success=%s sharpness=%.1f min_required=%.1f "
                     "attempt=%d lens_position=%s af_state=%s",
@@ -200,6 +219,21 @@ class AutofocusController:
             min_required_sharpness=sharpness_threshold,
         )
 
+    async def _measure_focus(
+        self,
+        camera: FocusCapableCamera,
+        roi_fraction: float,
+    ) -> tuple[Any, float, int | None, Any]:
+        preview = await asyncio.to_thread(camera.capture_preview_array)
+        if preview is None or getattr(preview, "size", 1) == 0:
+            raise AutofocusError("Invalid preview frame for sharpness check")
+        sharpness = laplacian_variance(preview, roi_fraction)
+        meta = self._read_metadata(camera)
+        af_state = None
+        if "AfState" in meta:
+            af_state = int(meta["AfState"])
+        return preview, sharpness, af_state, meta.get("LensPosition")
+
     def _read_metadata(self, camera: FocusCapableCamera) -> dict[str, Any]:
         reader = getattr(camera, "capture_metadata", None)
         if reader is None:
@@ -245,7 +279,8 @@ class AutofocusController:
     async def _trigger_af(self, camera: FocusCapableCamera) -> None:
         def _do() -> None:
             # AfModeAuto=1, AfTriggerStart=0 (libcamera control_ids).
-            camera.set_controls({"AfMode": 1, "AfTrigger": 0})
+            # AfModeAuto=1, AfTriggerStart=0, AfSpeedFast=1 (libcamera control_ids).
+            camera.set_controls({"AfMode": 1, "AfTrigger": 0, "AfSpeed": 1})
 
         await asyncio.to_thread(_do)
 

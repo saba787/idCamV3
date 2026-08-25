@@ -65,38 +65,61 @@ class FakeCamera:
 
 class TestAutofocusController:
     @pytest.mark.asyncio
-    async def test_prefers_autofocus_cycle_over_af_mode_controls(self):
+    async def test_already_sharp_skips_hardware_cycle(self):
         camera = FakeCamera()
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
         ctl.probe_capabilities(camera)
-        assert ctl.capabilities.af_mode is True
-        assert ctl.capabilities.autofocus_cycle is True
+        result = await ctl.run_autofocus(camera, sharpness_threshold=1.0)
+        assert result.success is True
+        assert result.method == "already_sharp"
+        assert camera.cycle_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_prefers_autofocus_cycle_when_not_yet_sharp(self):
+        class NeedsCycle(FakeCamera):
+            def capture_preview_array(self) -> np.ndarray:
+                if self.cycle_calls:
+                    return _sharp_frame()
+                return np.full((120, 160, 3), 128, dtype=np.uint8)
+
+        camera = NeedsCycle()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
         result = await ctl.run_autofocus(camera, sharpness_threshold=1.0)
         assert result.success is True
         assert camera.cycle_calls == 1
-        assert camera.set_calls == []
         assert result.method == "autofocus_cycle"
 
     @pytest.mark.asyncio
     async def test_wait_reads_af_state_from_metadata_not_control_ranges(self):
-        camera = FakeCamera(has_cycle=False)
+        class NeedsTrigger(FakeCamera):
+            def capture_preview_array(self) -> np.ndarray:
+                if self.set_calls:
+                    return _sharp_frame()
+                return np.full((120, 160, 3), 128, dtype=np.uint8)
+
+        camera = NeedsTrigger(has_cycle=False)
         camera.advertised["AfState"] = (0, 3, 0)
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
         caps = ctl.probe_capabilities(camera)
-        # hasattr(camera, "autofocus_cycle") is still True on the class; hide it.
         caps.autofocus_cycle = False
         ctl.capabilities = caps
         result = await ctl.run_autofocus(camera, sharpness_threshold=1.0)
         assert result.success is True
         assert camera.metadata_calls >= 1
-        assert result.af_state == 2
         assert camera.set_calls
         assert camera.set_calls[0]["AfMode"] == 1
         assert camera.set_calls[0]["AfTrigger"] == 0
 
     @pytest.mark.asyncio
     async def test_missing_af_state_does_not_block_until_timeout(self):
-        camera = FakeCamera(has_cycle=False, metadata={"LensPosition": 0.8})
+        class NeedsTrigger(FakeCamera):
+            def capture_preview_array(self) -> np.ndarray:
+                if self.set_calls:
+                    return _sharp_frame()
+                return np.full((120, 160, 3), 128, dtype=np.uint8)
+
+        camera = NeedsTrigger(has_cycle=False, metadata={"LensPosition": 0.8})
         ctl = AutofocusController(CameraConfig(af_timeout_sec=2.0, af_max_retries=1))
         caps = ctl.probe_capabilities(camera)
         caps.autofocus_cycle = False

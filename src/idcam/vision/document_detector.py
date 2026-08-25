@@ -33,6 +33,32 @@ class DocumentDetectionDebug:
     presence_frames: int
     stable_frames_required: int
     detected: bool
+    reject_reason: str = ""
+    roi_width: int = 0
+    roi_height: int = 0
+    frame_width: int = 0
+    frame_height: int = 0
+    gray_std: float = 0.0
+    gray_mean: float = 0.0
+    frame_motion: float = 0.0
+
+
+def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -> float:
+    """Fraction of ROI pixels with Sobel magnitude above ``magnitude_threshold``.
+
+    Canny(50, 150) misses printed texture on a mildly defocused 1080p preview.
+    Sobel magnitude still measures document structure without lowering the
+    configured edge_density_threshold.
+    """
+    if gray.size == 0:
+        return 0.0
+    work = np.ascontiguousarray(gray)
+    if work.dtype != np.uint8:
+        work = np.clip(work, 0, 255).astype(np.uint8)
+    gx = cv2.Sobel(work, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(work, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    return float(np.count_nonzero(mag > magnitude_threshold)) / mag.size
 
 
 class DocumentDetector:
@@ -49,6 +75,13 @@ class DocumentDetector:
         self._presence_frames = 0
         self._last_motion = 0.0
         self._last_edge_density = 0.0
+        self._last_reject_reason = "no_frame"
+        self._last_roi_size = (0, 0)
+        self._last_frame_size = (0, 0)
+        self._last_gray_std = 0.0
+        self._last_gray_mean = 0.0
+        self._prev_gray: np.ndarray | None = None
+        self._last_frame_motion = 0.0
 
     @property
     def last_motion(self) -> float:
@@ -72,11 +105,22 @@ class DocumentDetector:
             presence_frames=self._presence_frames,
             stable_frames_required=self.config.stable_frames_required,
             detected=detected,
+            reject_reason="" if detected else self._last_reject_reason,
+            roi_width=self._last_roi_size[0],
+            roi_height=self._last_roi_size[1],
+            frame_width=self._last_frame_size[0],
+            frame_height=self._last_frame_size[1],
+            gray_std=self._last_gray_std,
+            gray_mean=self._last_gray_mean,
+            frame_motion=self._last_frame_motion,
         )
 
     def reset_baseline(self) -> None:
         self._baseline = None
         self._presence_frames = 0
+        self._prev_gray = None
+        self._last_frame_motion = 0.0
+        self._last_reject_reason = "no_frame"
 
     def update_baseline(self, frame: np.ndarray) -> None:
         """Update baseline from a stable empty scene."""
@@ -89,28 +133,49 @@ class DocumentDetector:
 
     def _get_roi(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
+        self._last_frame_size = (int(w), int(h))
         frac = self.config.roi_center_fraction
         rh, rw = int(h * frac), int(w * frac)
         y0, x0 = (h - rh) // 2, (w - rw) // 2
         self._roi_slice = (slice(y0, y0 + rh), slice(x0, x0 + rw))
+        self._last_roi_size = (int(rw), int(rh))
         return frame[y0 : y0 + rh, x0 : x0 + rw]
 
     def _to_gray(self, frame: np.ndarray) -> np.ndarray:
         if frame.ndim == 3:
+            if frame.shape[2] == 4:
+                return cv2.cvtColor(frame, cv2.COLOR_RGBA2GRAY)
             return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         return frame
 
     def _metrics(self, frame: np.ndarray) -> tuple[float, float]:
         gray = self._to_gray(self._get_roi(frame))
+        gray = np.ascontiguousarray(gray)
+        edge_density = gradient_edge_density(gray)
+        self._last_gray_std = float(np.std(gray))
+        self._last_gray_mean = float(np.mean(gray))
+        self._last_edge_density = edge_density
+        if self._prev_gray is not None and self._prev_gray.shape == gray.shape:
+            self._last_frame_motion = float(np.mean(cv2.absdiff(gray, self._prev_gray)))
+        else:
+            self._last_frame_motion = 0.0
+        self._prev_gray = gray.copy()
         if self._baseline is None:
             self._baseline = gray.astype(np.float32)
-            return 0.0, 0.0
+            self._last_motion = 0.0
+            self._last_reject_reason = "baseline_initialized"
+            return 0.0, edge_density
         diff = cv2.absdiff(gray, self._baseline.astype(np.uint8))
         motion = float(np.mean(diff))
-        edges = cv2.Canny(gray, 50, 150)
-        edge_density = float(np.count_nonzero(edges)) / edges.size
         self._last_motion = motion
-        self._last_edge_density = edge_density
+        if motion <= self.config.motion_threshold and edge_density <= self.config.edge_density_threshold:
+            self._last_reject_reason = "below_motion_and_edge"
+        elif motion <= self.config.motion_threshold:
+            self._last_reject_reason = "below_motion_threshold"
+        elif edge_density <= self.config.edge_density_threshold:
+            self._last_reject_reason = "below_edge_density_threshold"
+        else:
+            self._last_reject_reason = ""
         return motion, edge_density
 
     def classify(self, frame: np.ndarray) -> DocumentPresence:
@@ -128,7 +193,7 @@ class DocumentDetector:
         self._presence_frames += 1
         if self._presence_frames < 2:
             return DocumentPresence.DOCUMENT_ENTERING
-        if motion > self.config.motion_threshold * 1.5:
+        if self._last_frame_motion > self.config.motion_threshold * 1.5:
             return DocumentPresence.DOCUMENT_MOVING
         if self._presence_frames < self.config.stable_frames_required:
             return DocumentPresence.DOCUMENT_STABLE

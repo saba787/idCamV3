@@ -25,6 +25,47 @@ except ImportError:
     Picamera2 = None  # type: ignore
     controls = None  # type: ignore
 
+# libcamera AfMode / AfTrigger integer values (stable across bindings).
+_AF_MODE_MANUAL = 0
+_AF_MODE_AUTO = 1
+_AF_MODE_CONTINUOUS = 2
+_AF_TRIGGER_START = 0
+_AF_STATE_FOCUSED = 2
+_AF_STATE_FAILED = 3
+
+
+def describe_preview_frame(frame: np.ndarray) -> dict[str, Any]:
+    """Return shape/dtype/channel statistics for diagnostics. Does not mutate ``frame``."""
+    info: dict[str, Any] = {
+        "shape": [int(x) for x in frame.shape],
+        "dtype": str(frame.dtype),
+        "ndim": int(frame.ndim),
+    }
+    if frame.ndim == 3 and frame.shape[-1] >= 3:
+        means = frame.mean(axis=(0, 1))
+        info["channel_means"] = {
+            "c0": round(float(means[0]), 2),
+            "c1": round(float(means[1]), 2),
+            "c2": round(float(means[2]), 2),
+        }
+    elif frame.ndim == 2:
+        info["channel_means"] = {"c0": round(float(frame.mean()), 2)}
+    return info
+
+
+def normalize_picamera_preview_frame(frame: np.ndarray) -> np.ndarray:
+    """Convert a Picamera2 RGB888/XRGB8888 ndarray to RGB channel order.
+
+    Picamera2 requests libcamera/DRM ``RGB888``, which is B,G,R in memory.
+    Picamera2's own JPEG encoder documents this as ``FORMAT_TABLE['RGB888'] = 'BGR'``.
+    idCam preview consumers (detector, sharpness, debug viewer) assume RGB.
+    """
+    if frame.ndim == 3 and frame.shape[-1] == 3:
+        return np.ascontiguousarray(frame[..., ::-1])
+    if frame.ndim == 3 and frame.shape[-1] == 4:
+        return np.ascontiguousarray(frame[..., 2::-1])
+    return frame
+
 
 class CameraManager:
     """
@@ -41,6 +82,8 @@ class CameraManager:
         self._started = False
         self._preview_config: Any = None
         self._still_config: Any = None
+        self._logged_preview_format = False
+        self._preview_af_mode: str | None = None
 
     @property
     def is_mock(self) -> bool:
@@ -75,6 +118,7 @@ class CameraManager:
                 self._picam2.configure(self._preview_config)
                 self._picam2.start()
                 self._started = True
+                self._logged_preview_format = False
                 logger.info(
                     "Camera initialized: preview=%dx%d capture=%dx%d",
                     self.config.preview_width,
@@ -82,6 +126,10 @@ class CameraManager:
                     self.config.capture_width,
                     self.config.capture_height,
                 )
+                try:
+                    self._enable_preview_autofocus(wait=True)
+                except Exception as exc:
+                    logger.warning("event=autofocus_preview_failed error=%s", exc)
             except Exception as exc:
                 self._started = False
                 self._picam2 = None
@@ -100,6 +148,8 @@ class CameraManager:
                 finally:
                     self._picam2 = None
             self._started = False
+            self._logged_preview_format = False
+            self._preview_af_mode = None
             logger.info("Camera shut down")
 
     def restart(self) -> None:
@@ -115,7 +165,12 @@ class CameraManager:
             if self._use_mock:
                 return self._mock_frame()
             assert self._picam2 is not None
-            return self._picam2.capture_array("main")
+            native = self._picam2.capture_array("main")
+            frame = normalize_picamera_preview_frame(native)
+            if not self._logged_preview_format:
+                self._log_preview_format(native, frame)
+                self._logged_preview_format = True
+            return frame
 
     def capture_still_to_file(self, path: Path) -> None:
         with self._lock:
@@ -126,28 +181,55 @@ class CameraManager:
                 return
 
             assert self._picam2 is not None
-            was_preview = True
+            lens_position = self._read_lens_position()
             try:
                 self._picam2.stop()
-                was_preview = False
                 self._picam2.configure(self._still_config)
                 self._picam2.start()
+                if lens_position is not None:
+                    self.set_controls(
+                        {
+                            "AfMode": self._af_mode_manual(),
+                            "LensPosition": float(lens_position),
+                        }
+                    )
+                    logger.info(
+                        "event=autofocus_result method=hold_lens_position lens_position=%s",
+                        lens_position,
+                    )
+                    try:
+                        self._picam2.capture_metadata()
+                    except Exception:
+                        logger.debug("event=still_pre_capture_metadata_failed", exc_info=True)
                 self._picam2.capture_file(str(path))
             finally:
                 try:
                     self._picam2.stop()
                     self._picam2.configure(self._preview_config)
                     self._picam2.start()
+                    try:
+                        self._enable_preview_autofocus(wait=False)
+                    except Exception as exc:
+                        logger.warning("event=autofocus_preview_failed error=%s", exc)
                 except Exception as exc:
                     logger.error("Failed to restore preview mode: %s", exc)
                     raise CameraError(f"Failed to restore preview after capture: {exc}") from exc
 
     def get_controls(self) -> dict[str, Any]:
+        """Return advertised control *capabilities* (typically min/max/default), not live values."""
         with self._lock:
             if self._use_mock:
-                return {"AfMode": 1, "AfState": 2, "AfTrigger": 0, "LensPosition": 0.0}
+                return {"AfMode": (0, 2, 0), "AfTrigger": (0, 1, 0), "LensPosition": (0.0, 10.0, 1.0)}
             assert self._picam2 is not None
             return dict(self._picam2.camera_controls)
+
+    def capture_metadata(self) -> dict[str, Any]:
+        """Return live per-frame metadata (AfState, LensPosition, etc.)."""
+        with self._lock:
+            if self._use_mock:
+                return {"AfMode": 1, "AfState": 2, "AfTrigger": 0, "LensPosition": 1.0}
+            assert self._picam2 is not None
+            return dict(self._picam2.capture_metadata())
 
     def set_controls(self, control_dict: dict[str, Any]) -> None:
         with self._lock:
@@ -162,16 +244,135 @@ class CameraManager:
                 return
             self._picam2.set_controls(filtered)
 
-    def autofocus_cycle(self) -> None:
+    def autofocus_cycle(self) -> bool:
         with self._lock:
             if self._use_mock:
                 time.sleep(0.2)
-                return
+                return True
             assert self._picam2 is not None
             if hasattr(self._picam2, "autofocus_cycle"):
-                self._picam2.autofocus_cycle()
-            else:
-                self.set_controls({"AfMode": 1, "AfTrigger": 0})
+                result = self._picam2.autofocus_cycle()
+                return True if result is None else bool(result)
+            self.set_controls({"AfMode": self._af_mode_auto(), "AfTrigger": self._af_trigger_start()})
+            return True
+
+    def _af_enum(self, group: str, name: str, fallback: int) -> int:
+        if controls is None:
+            return fallback
+        enum_group = getattr(controls, group, None)
+        if enum_group is None:
+            return fallback
+        value = getattr(enum_group, name, None)
+        return fallback if value is None else int(value)
+
+    def _af_mode_manual(self) -> int:
+        return self._af_enum("AfModeEnum", "Manual", _AF_MODE_MANUAL)
+
+    def _af_mode_auto(self) -> int:
+        return self._af_enum("AfModeEnum", "Auto", _AF_MODE_AUTO)
+
+    def _af_mode_continuous(self) -> int:
+        return self._af_enum("AfModeEnum", "Continuous", _AF_MODE_CONTINUOUS)
+
+    def _af_trigger_start(self) -> int:
+        return self._af_enum("AfTriggerEnum", "Start", _AF_TRIGGER_START)
+
+    def _af_mode_max(self) -> int | None:
+        if self._picam2 is None:
+            return None
+        info = self._picam2.camera_controls.get("AfMode")
+        if info is None:
+            return None
+        try:
+            return int(info[1])
+        except (TypeError, IndexError, ValueError):
+            return self._af_mode_continuous()
+
+    def _read_lens_position(self) -> float | None:
+        if self._picam2 is None:
+            return None
+        try:
+            meta = dict(self._picam2.capture_metadata())
+        except Exception:
+            return None
+        value = meta.get("LensPosition")
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _enable_preview_autofocus(self, *, wait: bool = True) -> None:
+        """Start real AF on the preview stream (Continuous, else one-shot Auto)."""
+        if self._use_mock or self._picam2 is None:
+            return
+        advertised = self._picam2.camera_controls
+        if "AfMode" not in advertised:
+            logger.info("event=autofocus_preview_skipped reason=AfMode_not_advertised")
+            return
+
+        continuous = self._af_mode_continuous()
+        max_mode = self._af_mode_max()
+        if max_mode is not None and max_mode >= continuous:
+            self.set_controls({"AfMode": continuous})
+            mode_name = "Continuous"
+            logger.info("event=autofocus_triggered mode=%s", mode_name)
+        else:
+            self.set_controls({"AfMode": self._af_mode_auto(), "AfTrigger": self._af_trigger_start()})
+            mode_name = "Auto"
+            logger.info("event=autofocus_triggered mode=%s trigger=Start", mode_name)
+        self._preview_af_mode = mode_name
+        if not wait:
+            return
+
+        deadline = time.monotonic() + min(float(self.config.af_timeout_sec), 3.0)
+        last_state: Any = None
+        last_lens: Any = None
+        while time.monotonic() < deadline:
+            try:
+                meta = dict(self._picam2.capture_metadata())
+            except Exception as exc:
+                logger.debug("event=autofocus_metadata_unavailable error=%s", exc)
+                break
+            last_state = meta.get("AfState")
+            last_lens = meta.get("LensPosition")
+            if last_state is None:
+                logger.info(
+                    "event=autofocus_result mode=%s af_state=unavailable lens_position=%s",
+                    mode_name,
+                    last_lens,
+                )
+                return
+            if int(last_state) in (_AF_STATE_FOCUSED, _AF_STATE_FAILED):
+                logger.info(
+                    "event=autofocus_result mode=%s af_state=%s lens_position=%s",
+                    mode_name,
+                    last_state,
+                    last_lens,
+                )
+                return
+            time.sleep(0.05)
+        logger.warning(
+            "event=autofocus_timeout mode=%s last_af_state=%s lens_position=%s",
+            mode_name,
+            last_state,
+            last_lens,
+        )
+
+    def _log_preview_format(self, native: np.ndarray, rgb: np.ndarray) -> None:
+        native_info = describe_preview_frame(native)
+        rgb_info = describe_preview_frame(rgb)
+        logger.info(
+            "event=preview_frame_format requested=RGB888 "
+            "native_order=BGR native_shape=%s native_dtype=%s native_means=%s "
+            "rgb_shape=%s rgb_means=%s",
+            native_info.get("shape"),
+            native_info.get("dtype"),
+            native_info.get("channel_means"),
+            rgb_info.get("shape"),
+            rgb_info.get("channel_means"),
+        )
 
     def _mock_frame(self) -> np.ndarray:
         h, w = self.config.preview_height, self.config.preview_width

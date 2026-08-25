@@ -1,7 +1,9 @@
 """Vision pipeline tests."""
 
+import cv2
 import numpy as np
 import pytest
+import cv2
 
 from idcam.config.schema import DetectionConfig
 from idcam.vision.document_detector import DocumentDetector, DocumentDetectionDebug
@@ -123,3 +125,20 @@ class TestSharpness:
         dark = np.full((100, 100), 30, dtype=np.uint8)
         bright = np.full((100, 100), 200, dtype=np.uint8)
         assert mean_brightness(dark) < mean_brightness(bright)
+
+
+class TestBlurKillsEdgeDensity:
+    def test_defocused_frame_has_near_zero_edges(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        sharp = np.full((240, 320, 3), 200, dtype=np.uint8)
+        sharp[40:200, 40:280] = 40
+        sharp[40:50, 40:280] = 0
+        sharp[190:200, 40:280] = 0
+        detector.update_baseline(np.full((240, 320, 3), 180, dtype=np.uint8))
+        detector.classify(sharp)
+        sharp_edges = detector.last_edge_density
+        blurry = cv2.GaussianBlur(sharp, (31, 31), 0)
+        detector.classify(blurry)
+        assert sharp_edges > detection_config.edge_density_threshold
+        assert detector.last_edge_density < sharp_edges
+

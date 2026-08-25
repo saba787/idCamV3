@@ -23,8 +23,9 @@ AF_STATE_FAILED = 3
 class FocusCapableCamera(Protocol):
     def get_controls(self) -> dict[str, Any]: ...
     def set_controls(self, controls: dict[str, Any]) -> None: ...
-    def autofocus_cycle(self) -> None: ...
+    def autofocus_cycle(self) -> Any: ...
     def capture_preview_array(self) -> Any: ...
+    def capture_metadata(self) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -109,37 +110,38 @@ class AutofocusController:
 
         for attempt in range(1, self.config.af_max_retries + 1):
             logger.info(
-                "event=autofocus_started attempt=%d/%d min_sharpness=%.1f degraded=%s",
+                "event=autofocus_start attempt=%d/%d min_sharpness=%.1f degraded=%s",
                 attempt,
                 self.config.af_max_retries,
                 sharpness_threshold,
                 self.capabilities.degraded,
             )
             try:
-                if self.capabilities.af_mode:
-                    await self._trigger_af(camera)
-                    last_af_state = await self._wait_for_af(camera)
-                    if last_af_state == AF_STATE_FAILED:
-                        logger.warning("AF reported failed state on attempt %d", attempt)
-                        continue
-                elif self.capabilities.autofocus_cycle:
-                    await asyncio.to_thread(camera.autofocus_cycle)
-                else:
-                    logger.warning("No AF controls; sharpness-only mode")
+                last_af_state = await self._run_hardware_af(camera, attempt)
 
                 preview = await asyncio.to_thread(camera.capture_preview_array)
                 if preview is None or getattr(preview, "size", 1) == 0:
                     raise AutofocusError("Invalid preview frame for sharpness check")
                 last_sharpness = laplacian_variance(preview, roi_fraction)
+                meta = self._read_metadata(camera)
+                lens = meta.get("LensPosition")
+                if last_af_state is None and "AfState" in meta:
+                    last_af_state = int(meta["AfState"])
                 logger.info(
-                    "event=autofocus_sharpness score=%.1f min_required=%.1f attempt=%d",
+                    "event=autofocus_result success=%s sharpness=%.1f min_required=%.1f "
+                    "attempt=%d lens_position=%s af_state=%s",
+                    last_sharpness >= sharpness_threshold,
                     last_sharpness,
                     sharpness_threshold,
                     attempt,
+                    lens,
+                    last_af_state,
                 )
 
                 if last_sharpness >= sharpness_threshold:
                     method = "af_controls" if self.capabilities.hardware_af_available else "sharpness_only"
+                    if self.capabilities.autofocus_cycle:
+                        method = "autofocus_cycle"
                     return AutofocusResult(
                         success=True,
                         sharpness=last_sharpness,
@@ -148,6 +150,7 @@ class AutofocusController:
                         method=method,
                         min_required_sharpness=sharpness_threshold,
                     )
+                logger.info("event=autofocus_retry attempt=%d reason=sharpness_below_threshold", attempt)
             except AutofocusError:
                 raise
             except Exception as exc:
@@ -170,16 +173,17 @@ class AutofocusController:
         if preview is None or getattr(preview, "size", 1) == 0:
             raise AutofocusError("Invalid preview frame for focus verification")
         sharpness = laplacian_variance(preview, roi_fraction)
-        af_state = None
-        if self.capabilities.af_state:
-            controls = camera.get_controls()
-            af_state = controls.get("AfState")
+        meta = self._read_metadata(camera)
+        af_state = meta.get("AfState")
+        if af_state is not None:
+            af_state = int(af_state)
 
         logger.info(
-            "event=focus_verification score=%.1f min_required=%.1f af_state=%s",
+            "event=focus_verification score=%.1f min_required=%.1f af_state=%s lens_position=%s",
             sharpness,
             sharpness_threshold,
             af_state,
+            meta.get("LensPosition"),
         )
 
         if sharpness < sharpness_threshold:
@@ -196,19 +200,77 @@ class AutofocusController:
             min_required_sharpness=sharpness_threshold,
         )
 
+    def _read_metadata(self, camera: FocusCapableCamera) -> dict[str, Any]:
+        reader = getattr(camera, "capture_metadata", None)
+        if reader is None:
+            return {}
+        try:
+            meta = reader()
+        except Exception as exc:
+            logger.debug("event=autofocus_metadata_unavailable error=%s", exc)
+            return {}
+        return dict(meta) if meta else {}
+
+    async def _run_hardware_af(self, camera: FocusCapableCamera, attempt: int) -> int | None:
+        """Trigger a real AF scan. Prefer Picamera2.autofocus_cycle (waits on metadata)."""
+        if self.capabilities.autofocus_cycle:
+            logger.info("event=autofocus_triggered method=autofocus_cycle attempt=%d", attempt)
+            try:
+                cycle_ok = await asyncio.wait_for(
+                    asyncio.to_thread(camera.autofocus_cycle),
+                    timeout=self.config.af_timeout_sec,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "event=autofocus_timeout method=autofocus_cycle attempt=%d timeout_sec=%.1f",
+                    attempt,
+                    self.config.af_timeout_sec,
+                )
+                return None
+            if cycle_ok is False:
+                logger.warning("event=autofocus_result success=false method=autofocus_cycle attempt=%d", attempt)
+            return None
+
+        if self.capabilities.af_mode:
+            logger.info(
+                "event=autofocus_triggered method=af_controls AfMode=Auto AfTrigger=Start attempt=%d",
+                attempt,
+            )
+            await self._trigger_af(camera)
+            return await self._wait_for_af(camera)
+
+        logger.warning("event=autofocus_triggered method=sharpness_only attempt=%d", attempt)
+        return None
+
     async def _trigger_af(self, camera: FocusCapableCamera) -> None:
         def _do() -> None:
+            # AfModeAuto=1, AfTriggerStart=0 (libcamera control_ids).
             camera.set_controls({"AfMode": 1, "AfTrigger": 0})
 
         await asyncio.to_thread(_do)
 
-    async def _wait_for_af(self, camera: FocusCapableCamera) -> int:
+    async def _wait_for_af(self, camera: FocusCapableCamera) -> int | None:
         deadline = time.monotonic() + self.config.af_timeout_sec
+        last_state: int | None = None
+        saw_state = False
         while time.monotonic() < deadline:
-            controls = await asyncio.to_thread(camera.get_controls)
-            state = controls.get("AfState", AF_STATE_IDLE)
-            if state in (AF_STATE_FOCUSED, AF_STATE_FAILED):
-                return int(state)
+            meta = await asyncio.to_thread(self._read_metadata, camera)
+            if "AfState" not in meta:
+                logger.info("event=autofocus_result af_state=unavailable source=metadata")
+                return None
+            saw_state = True
+            last_state = int(meta["AfState"])
+            if last_state in (AF_STATE_FOCUSED, AF_STATE_FAILED):
+                logger.info(
+                    "event=autofocus_result af_state=%s lens_position=%s",
+                    last_state,
+                    meta.get("LensPosition"),
+                )
+                return last_state
             await asyncio.sleep(0.1)
-        logger.warning("AF state wait timed out after %.1fs", self.config.af_timeout_sec)
-        return AF_STATE_FAILED
+        logger.warning(
+            "event=autofocus_timeout after_sec=%.1f last_af_state=%s",
+            self.config.af_timeout_sec,
+            last_state,
+        )
+        return AF_STATE_FAILED if saw_state else None

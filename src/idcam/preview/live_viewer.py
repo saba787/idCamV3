@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
+from idcam.camera.manager import describe_preview_frame
 from idcam.config.schema import DebugConfig
 from idcam.logging.setup import get_logger
 
@@ -101,6 +102,11 @@ def resize_debug_frame(frame: np.ndarray, max_width: int) -> np.ndarray:
 
 
 def _to_bgr(frame: np.ndarray) -> np.ndarray:
+    """Convert an RGB preview frame to BGR for OpenCV JPEG encoding.
+
+    CameraManager.normalize_picamera_preview_frame() delivers RGB (or gray).
+    OpenCV imencode expects BGR.
+    """
     if frame.ndim == 2:
         return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     if frame.shape[2] == 4:
@@ -375,6 +381,8 @@ class LiveDebugViewer:
         self._actual_fps = 0.0
         self._client_log_times: deque[float] = deque(maxlen=_MAX_CLIENT_LOGS_PER_MINUTE)
         self._started = False
+        self._frame_info: dict[str, Any] | None = None
+        self._logged_encode_format = False
 
     @property
     def is_running(self) -> bool:
@@ -467,6 +475,12 @@ class LiveDebugViewer:
             if frame is not None:
                 self._latest_frame = frame.copy()
                 self._frame_seq += 1
+                info = describe_preview_frame(self._latest_frame)
+                if self._latest_frame.ndim == 3:
+                    info["channel_order"] = "RGB"
+                elif self._latest_frame.ndim == 2:
+                    info["channel_order"] = "GRAY"
+                self._frame_info = info
             self._snapshot = DebugSnapshot(
                 frame=None,
                 timestamp=time.time(),
@@ -498,6 +512,8 @@ class LiveDebugViewer:
 
     def status_dict(self) -> dict[str, Any]:
         snap = self.snapshot_meta()
+        with self._meta_lock:
+            frame_info = dict(self._frame_info) if self._frame_info else None
         return {
             "enabled": True,
             "state": snap.state,
@@ -513,6 +529,7 @@ class LiveDebugViewer:
             "autofocus_available": snap.autofocus_available,
             "fps": round(self._actual_fps or self.config.fps, 2),
             "timestamp": snap.timestamp,
+            "frame": frame_info,
         }
 
     def wait_jpeg(self, last_seq: int, timeout: float) -> tuple[int, bytes | None]:
@@ -587,6 +604,15 @@ class LiveDebugViewer:
 
         debug_copy = frame.copy()
         debug_copy = resize_debug_frame(debug_copy, self.config.max_width)
+        if not self._logged_encode_format:
+            info = describe_preview_frame(debug_copy)
+            logger.info(
+                "event=preview_encode_format shape=%s dtype=%s means=%s assumed_order=RGB",
+                info.get("shape"),
+                info.get("dtype"),
+                info.get("channel_means"),
+            )
+            self._logged_encode_format = True
         if self.config.overlay:
             debug_copy = draw_overlay(debug_copy, snap, self._actual_fps or self.config.fps)
         return encode_jpeg(debug_copy, self.config.jpeg_quality)

@@ -9,6 +9,7 @@ import time
 import urllib.request
 from http.client import HTTPResponse
 
+import cv2
 import numpy as np
 import pytest
 
@@ -213,6 +214,8 @@ class TestDebugHttp:
         assert "motion" in payload
         assert "edge_density" in payload
         assert "stable_count" in payload
+        assert payload["frame"]["channel_order"] == "RGB"
+        assert payload["frame"]["shape"] == [80, 120, 3]
 
     def test_html_page(self, debug_viewer):
         url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/live"
@@ -314,6 +317,17 @@ class TestDebugHttp:
         jpeg = encode_jpeg(image, 70)
         assert jpeg[:2] == b"\xff\xd8"
         assert jpeg[-2:] == b"\xff\xd9"
+
+    def test_encode_jpeg_keeps_rgb_red(self):
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        frame[:] = (220, 15, 15)  # RGB red
+        jpeg = encode_jpeg(frame, 95)
+        decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert decoded is not None
+        b_mean, g_mean, r_mean = decoded.mean(axis=(0, 1))
+        assert r_mean > b_mean
+        assert r_mean > g_mean
+        assert r_mean > 150
 
 
 class TestDetectorFrameIsolation:

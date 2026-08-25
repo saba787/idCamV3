@@ -10,6 +10,7 @@ import numpy as np
 
 from idcam.config.schema import DetectionConfig
 from idcam.logging.setup import get_logger
+from idcam.vision.sharpness import clip_roi
 
 logger = get_logger("vision.document_detector")
 
@@ -41,6 +42,7 @@ class DocumentDetectionDebug:
     gray_std: float = 0.0
     gray_mean: float = 0.0
     frame_motion: float = 0.0
+    document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -> float:
@@ -82,6 +84,7 @@ class DocumentDetector:
         self._last_gray_mean = 0.0
         self._prev_gray: np.ndarray | None = None
         self._last_frame_motion = 0.0
+        self._last_document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
 
     @property
     def last_motion(self) -> float:
@@ -101,6 +104,51 @@ class DocumentDetector:
         rh, rw = int(h * frac), int(w * frac)
         y0, x0 = (h - rh) // 2, (w - rw) // 2
         return int(x0), int(y0), int(rw), int(rh)
+
+    def document_preview_roi(self, frame: np.ndarray | None = None) -> tuple[int, int, int, int]:
+        """Document bounding box in preview pixels, else the centered detection ROI.
+
+        Coordinates are (x, y, width, height) in the current preview frame,
+        matching laplacian_variance / AfWindows mapping — not sensor pixels.
+        """
+        if frame is None:
+            if self._last_document_roi != (0, 0, 0, 0):
+                return self._last_document_roi
+            return self.roi_rect()
+        center = self.roi_rect(frame.shape)
+        tight = self._tight_document_box(frame, center)
+        self._last_document_roi = clip_roi(tight, frame.shape)
+        return self._last_document_roi
+
+    def _tight_document_box(
+        self,
+        frame: np.ndarray,
+        center: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        x0, y0, rw, rh = center
+        roi = self._to_gray(frame[y0 : y0 + rh, x0 : x0 + rw])
+        if roi.size == 0:
+            return center
+        work = np.ascontiguousarray(roi)
+        if work.dtype != np.uint8:
+            work = np.clip(work, 0, 255).astype(np.uint8)
+        blur = cv2.GaussianBlur(work, (5, 5), 0)
+        _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return center
+        contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(contour) < 0.08 * float(rw * rh):
+            return center
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        pad_x = max(4, int(bw * 0.06))
+        pad_y = max(4, int(bh * 0.06))
+        return (
+            x0 + bx - pad_x,
+            y0 + by - pad_y,
+            bw + 2 * pad_x,
+            bh + 2 * pad_y,
+        )
 
     def debug_info(self) -> DocumentDetectionDebug:
         """Return last computed metrics. Does not run detection or mutate state."""
@@ -124,6 +172,7 @@ class DocumentDetector:
             gray_std=self._last_gray_std,
             gray_mean=self._last_gray_mean,
             frame_motion=self._last_frame_motion,
+            document_roi=self._last_document_roi,
         )
 
     def reset_baseline(self) -> None:
@@ -131,6 +180,7 @@ class DocumentDetector:
         self._presence_frames = 0
         self._prev_gray = None
         self._last_frame_motion = 0.0
+        self._last_document_roi = (0, 0, 0, 0)
         self._last_reject_reason = "no_frame"
 
     def update_baseline(self, frame: np.ndarray) -> None:
@@ -202,6 +252,7 @@ class DocumentDetector:
             return DocumentPresence.NO_DOCUMENT
 
         self._presence_frames += 1
+        self.document_preview_roi(frame)
         if self._presence_frames < 2:
             return DocumentPresence.DOCUMENT_ENTERING
         if self._last_frame_motion > self.config.motion_threshold * 1.5:

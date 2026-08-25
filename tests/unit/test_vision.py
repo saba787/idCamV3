@@ -181,6 +181,38 @@ class TestStabilityDetector:
         assert info.threshold == detection_config.motion_threshold
         assert sd.update(frame) is True
 
+    def test_small_preview_noise_keeps_stable_document(self, detection_config):
+        sd = StabilityDetector(detection_config)
+        frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+        for _ in range(10):
+            sd.update(frame)
+        assert sd.stable_count >= detection_config.stable_frames_required
+        noisy = frame.copy()
+        noisy[200:210, 200:210] = 129
+        assert sd.update(noisy) is True
+        assert sd.stable_count >= detection_config.stable_frames_required
+
+
+class TestDocumentPreviewRoi:
+    def test_roi_is_preview_pixels_inside_frame(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        empty = np.full((1080, 1920, 3), 200, dtype=np.uint8)
+        doc = empty.copy()
+        doc[200:880, 400:1520] = 40
+        doc[200:230, 400:1520] = 0
+        doc[850:880, 400:1520] = 0
+        detector.update_baseline(empty)
+        detector.detect(doc)
+        roi = detector.document_preview_roi(doc)
+        x, y, w, h = roi
+        assert x >= 0 and y >= 0
+        assert x + w <= 1920
+        assert y + h <= 1080
+        assert w > 100 and h > 100
+        # Must not look like the old sensor-space debug window.
+        assert roi != (1936, 1960, 5376, 3024)
+        assert x + w <= 1920
+
 
 class TestSharpness:
     def test_blurry_lower_than_sharp(self):
@@ -191,7 +223,7 @@ class TestSharpness:
     def test_brightness(self):
         dark = np.full((100, 100), 30, dtype=np.uint8)
         bright = np.full((100, 100), 200, dtype=np.uint8)
-        assert mean_brightness(dark) < mean_brightness(bright)
+        assert mean_brightness(bright) > mean_brightness(dark)
 
 
 class TestBlurKillsEdgeDensity:

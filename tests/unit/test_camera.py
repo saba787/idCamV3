@@ -7,6 +7,7 @@ import numpy as np
 from idcam.camera.manager import (
     CameraManager,
     describe_preview_frame,
+    map_preview_roi_to_sensor,
     normalize_picamera_preview_frame,
 )
 from idcam.config.schema import CameraConfig
@@ -61,4 +62,16 @@ class TestMockCamera:
         advertised = mgr.get_controls()
         assert "AfMode" in advertised
         assert "AfState" not in advertised
+        mapping = mgr.apply_document_focus_window((288, 162, 1344, 756), (1920, 1080))
+        assert mapping["preview_roi"] == (288, 162, 1344, 756)
+        assert mapping["preview_size"] == (1920, 1080)
+        assert mapping["sensor_roi"][2] > 0
         mgr.shutdown()
+
+
+class TestPreviewToSensorMap:
+    def test_16_by_9_preview_not_70_percent_of_4_by_3_sensor(self):
+        preview_roi = (288, 162, 1344, 756)
+        mapped = map_preview_roi_to_sensor(preview_roi, (1920, 1080), (0, 898, 9152, 5148))
+        assert mapped != (1936, 1960, 5376, 3024)
+        assert mapped[1] >= 898

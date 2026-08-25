@@ -15,21 +15,59 @@ def roi_rect(frame_shape: tuple[int, ...], roi_fraction: float = 0.7) -> tuple[i
     return int(x0), int(y0), int(rw), int(rh)
 
 
-def laplacian_variance(frame: np.ndarray, roi_fraction: float = 0.7) -> float:
-    """
-    Compute Laplacian variance as sharpness metric on the document ROI.
-    Higher values indicate sharper images.
-    """
+def clip_roi(roi: tuple[int, int, int, int], frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+    h, w = int(frame_shape[0]), int(frame_shape[1])
+    x, y, rw, rh = (int(v) for v in roi)
+    x = max(0, min(x, max(0, w - 1)))
+    y = max(0, min(y, max(0, h - 1)))
+    rw = max(1, min(rw, w - x))
+    rh = max(1, min(rh, h - y))
+    return x, y, rw, rh
+
+
+def laplacian_variance(
+    frame: np.ndarray,
+    roi_fraction: float = 0.7,
+    roi: tuple[int, int, int, int] | None = None,
+) -> float:
+    """Laplacian variance on a preview-pixel ROI. Higher is sharper."""
     if frame.ndim == 3:
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
     else:
         gray = frame
 
-    x0, y0, rw, rh = roi_rect(gray.shape, roi_fraction)
-    roi = gray[y0 : y0 + rh, x0 : x0 + rw]
-
-    laplacian = cv2.Laplacian(roi, cv2.CV_64F)
+    if roi is None:
+        x0, y0, rw, rh = roi_rect(gray.shape, roi_fraction)
+    else:
+        x0, y0, rw, rh = clip_roi(roi, gray.shape)
+    patch = gray[y0 : y0 + rh, x0 : x0 + rw]
+    laplacian = cv2.Laplacian(patch, cv2.CV_64F)
     return float(laplacian.var())
+
+
+def accept_preview_focus(
+    *,
+    before: float,
+    after: float,
+    absolute_floor: float,
+    min_ratio: float = 1.2,
+    min_delta: float = 2.0,
+) -> bool:
+    """Accept preview AF from relative improvement; absolute floor is not a veto.
+
+    10 → 30 succeeds even when floor is 48.
+    10 → 8 fails.
+    """
+    if after < 0:
+        return False
+    if before <= 0:
+        return after >= max(absolute_floor, min_delta)
+    ratio = after / before
+    if ratio >= min_ratio and (after - before) >= min_delta:
+        return True
+    if after >= absolute_floor and after >= before * 0.95:
+        return True
+    return False
 
 
 def mean_brightness(frame: np.ndarray) -> float:

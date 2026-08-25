@@ -104,6 +104,11 @@ class ApplicationOrchestrator:
         self._awaiting_clear_scene = False
         self._clear_scene_count = 0
         self._last_scene_empty = False
+        self._last_transition_reason = ""
+        self._capture_started = False
+        self._upload_started = False
+        self._upload_result = ""
+        self._manual_capture_requested = False
         if config.debug.enabled:
             self._debug_viewer = LiveDebugViewer(config.debug)
             self._debug_viewer.set_capture_handler(self.request_manual_capture)
@@ -327,26 +332,27 @@ class ApplicationOrchestrator:
             logger.info("event=pipeline_stage stage=manual_capture_start state=IDLE")
             self.stability.reset()
             self._resume_state = AppState.IDLE
+            self._awaiting_clear_scene = False
+            self._manual_capture_requested = True
             self._begin_transaction(trigger="manual")
-            self._set_manual_phase("detected", "Manual capture started")
+            self._set_manual_phase("focusing", "Manual capture started")
             self._publish_debug(frame)
             self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
             return
-        if self._awaiting_clear_scene:
-            present = self.detector.detect(frame)
-            self._last_scene_empty = not present
-            self._publish_debug(frame)
-            if not present:
-                self._clear_scene_count += 1
-            else:
-                self._clear_scene_count = 0
+        detected = self.detector.detect(frame)
+        self._publish_debug(frame)
+        if self._awaiting_clear_scene and not detected:
+            self._last_scene_empty = True
+            self._clear_scene_count += 1
             if self._clear_scene_count >= self.config.detection.removal_frames_required:
                 self._awaiting_clear_scene = False
                 self._clear_scene_count = 0
                 logger.info("event=auto_capture_armed reason=scene_cleared_after_failure")
             return
-        detected = self.detector.detect(frame)
-        self._publish_debug(frame)
+        if self._awaiting_clear_scene and detected:
+            logger.info("event=auto_capture_retry reason=document_still_present_after_failure")
+            self._awaiting_clear_scene = False
+            self._clear_scene_count = 0
         if detected:
             logger.info(
                 "event=document_detected motion=%.2f edge_density=%.4f",
@@ -356,7 +362,7 @@ class ApplicationOrchestrator:
             logger.info("event=pipeline_stage stage=document_detected")
             self.stability.reset()
             self._begin_transaction(trigger="auto")
-            self._transition(AppState.DOCUMENT_DETECTED)
+            self._transition(AppState.DOCUMENT_DETECTED, reason="document_detected")
         else:
             self._idle_reject_count += 1
             if self._idle_reject_count == 1 or self._idle_reject_count % 50 == 0:
@@ -394,6 +400,9 @@ class ApplicationOrchestrator:
         self._transaction = txn
         self._capture_path = None
         self._idle_reject_count = 0
+        self._capture_started = False
+        self._upload_started = False
+        self._upload_result = ""
         set_log_context(capture_id=txn.capture_id)
         logger.info("event=transaction_started capture_id=%s trigger=%s", txn.capture_id, trigger)
         return txn
@@ -431,6 +440,7 @@ class ApplicationOrchestrator:
             self._command_event.clear()
             self._manual_phase = "queued"
             self._manual_message = "Waiting for capture pipeline"
+            self._manual_capture_requested = True
         logger.info("event=pipeline_stage stage=manual_capture_queued")
         if not self._command_event.wait(timeout):
             with self._cmd_lock:
@@ -484,7 +494,11 @@ class ApplicationOrchestrator:
     async def _document_detected_tick(self) -> None:
         if not self._claim_state_action():
             return
-        self._transition(AppState.WAITING_FOR_STABILITY)
+        if self._transaction and self._transaction.trigger == "manual":
+            self._set_manual_phase("focusing", "Focusing...")
+            self._transition(AppState.FOCUSING, reason="manual_capture_skip_stability")
+            return
+        self._transition(AppState.WAITING_FOR_STABILITY, reason="auto_wait_stability")
 
     async def _stability_tick(self) -> None:
         frame = await self._safe_preview()
@@ -498,12 +512,17 @@ class ApplicationOrchestrator:
             return
         if self.stability.update(frame):
             self._publish_debug(frame)
-            logger.info("event=document_stable frames=%d", self.stability.stable_count)
+            logger.info(
+                "event=document_stable frames=%d stability_motion=%.2f threshold=%.2f",
+                self.stability.stable_count,
+                self.stability.debug_info().motion,
+                self.stability.debug_info().threshold,
+            )
             assert self._transaction is not None
             self._transaction.phase = TransactionPhase.STABILIZING
             logger.info("event=pipeline_stage stage=focusing reason=document_stable")
             self._set_manual_phase("focusing", "Focusing...")
-            self._transition(AppState.FOCUSING)
+            self._transition(AppState.FOCUSING, reason="document_stable")
         else:
             self._publish_debug(frame)
             self.sm.touch_progress()
@@ -514,18 +533,27 @@ class ApplicationOrchestrator:
         assert self._transaction is not None
         if self._shutdown_event.is_set():
             return
-        if not await self._check_motion_abort():
+        # Lens motion during AF must not be treated as the document moving.
+        frame = await self._safe_preview()
+        if frame is None:
             return
+        preview_roi = self.detector.document_preview_roi(frame)
+        self._publish_debug(frame)
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
         self._set_manual_phase("focusing", "Focusing...")
-        logger.info("event=pipeline_stage stage=focusing capture_id=%s", self._transaction.capture_id)
+        logger.info(
+            "event=pipeline_stage stage=focusing capture_id=%s preview_roi=%s",
+            self._transaction.capture_id,
+            preview_roi,
+        )
         min_sharp = self.config.quality.min_sharpness * 0.6
         try:
             result = await self.autofocus.run_autofocus(
                 self.camera,
                 sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
+                preview_roi=preview_roi,
             )
             pause = getattr(self.camera, "pause_autofocus", None)
             if callable(pause):
@@ -533,11 +561,12 @@ class ApplicationOrchestrator:
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
             logger.info(
-                "event=pipeline_stage stage=focus_verification method=%s sharpness=%.1f",
+                "event=pipeline_stage stage=focus_verification method=%s sharpness=%.1f ratio=%.2f",
                 result.method,
                 result.sharpness,
+                result.improvement_ratio,
             )
-            self._transition(AppState.FOCUS_VERIFICATION)
+            self._transition(AppState.FOCUS_VERIFICATION, reason="autofocus_accepted")
         except AutofocusError as exc:
             logger.error("event=autofocus_failed %s", exc)
             await self._fail_transaction_and_wait("focus_failed", str(exc))
@@ -546,19 +575,19 @@ class ApplicationOrchestrator:
         if not self._claim_state_action():
             return
         assert self._transaction is not None
-        if not await self._check_motion_abort():
-            return
         min_sharp = self.config.quality.min_sharpness * 0.6
         self._transaction.focus_verify_attempts += 1
+        preview_roi = self.detector.document_preview_roi()
         try:
             result = await self.autofocus.verify_focus(
                 self.camera,
                 sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
+                preview_roi=preview_roi,
             )
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
-            self._transition(AppState.CAPTURING)
+            self._transition(AppState.CAPTURING, reason="focus_verified")
         except AutofocusError:
             if self._transaction.focus_verify_attempts < self.config.camera.af_verify_max_retries:
                 self._transition(AppState.FOCUSING, reason="refocus")
@@ -576,6 +605,7 @@ class ApplicationOrchestrator:
             return
         output_path = self.temp_store.create_temp_path()
         self._transaction.mark_capture_started(str(output_path))
+        self._capture_started = True
         self._set_manual_phase("capturing", "Capturing...")
         logger.info("event=pipeline_stage stage=capturing path=%s", output_path)
         try:
@@ -621,6 +651,8 @@ class ApplicationOrchestrator:
         assert self._transaction is not None
         assert self._capture_path is not None
         self._transaction.mark_upload_started()
+        self._upload_started = True
+        self._upload_result = "started"
         self._set_manual_phase("uploading", "Uploading...")
         logger.info(
             "event=pipeline_stage stage=uploading capture_id=%s path=%s",
@@ -636,14 +668,17 @@ class ApplicationOrchestrator:
         try:
             self._pending_response = await self.api.upload_document(request)
             self._transaction.mark_upload_completed(self._pending_response.http_status)
+            self._upload_result = f"http_{self._pending_response.http_status}"
             self.sm.touch_progress()
-            self._transition(AppState.WAITING_FOR_SERVER)
+            self._transition(AppState.WAITING_FOR_SERVER, reason="upload_sent")
         except (ServerRejectedError, ServerError, ProtocolError) as exc:
             self.temp_store.cleanup(self._capture_path)
             key = "server_rejected" if isinstance(exc, ServerRejectedError) else "upload_failed"
+            self._upload_result = key
             await self._fail_transaction_and_wait(key, str(exc))
         except NetworkError as exc:
             self.temp_store.cleanup(self._capture_path)
+            self._upload_result = "upload_failed"
             await self._fail_transaction_and_wait("upload_failed", str(exc))
 
     async def _waiting_server_tick(self) -> None:
@@ -678,7 +713,8 @@ class ApplicationOrchestrator:
                     "message": "Upload accepted",
                 }
             )
-            self._transition(AppState.SUCCESS)
+            self._upload_result = "accepted"
+            self._transition(AppState.SUCCESS, reason="upload_accepted")
         else:
             msg = response.message if response else "Upload failed"
             self.health.record_failure(msg)
@@ -686,6 +722,7 @@ class ApplicationOrchestrator:
             failure_key = "upload_failed"
             if response and response.outcome == UploadOutcome.REJECTED:
                 failure_key = "server_rejected"
+            self._upload_result = failure_key
             await self._fail_transaction_and_wait(failure_key, msg or "Upload failed")
 
     async def _success_tick(self) -> None:
@@ -704,7 +741,8 @@ class ApplicationOrchestrator:
             logger.info("event=pipeline_stage stage=manual_capture_start state=WAITING_FOR_REMOVAL")
             self.stability.reset()
             self._begin_transaction(trigger="manual")
-            self._set_manual_phase("detected", "Manual capture started")
+            self._manual_capture_requested = True
+            self._set_manual_phase("focusing", "Manual capture started")
             self._publish_debug(frame)
             self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
             return
@@ -856,6 +894,7 @@ class ApplicationOrchestrator:
                 "message": f"{failure_key}: {detail}",
             }
         )
+        self.stability.reset()
         if dest == AppState.IDLE:
             self._awaiting_clear_scene = True
             self._clear_scene_count = 0
@@ -907,6 +946,7 @@ class ApplicationOrchestrator:
         if self._shutdown_event.is_set() and target not in {AppState.SHUTDOWN, AppState.RECOVERY}:
             target = AppState.SHUTDOWN
         prev = self.sm.state
+        self._last_transition_reason = reason or f"{prev.value}->{target.value}"
         self.sm.transition(target, reason=reason)
         self._state_action_claimed = None
         if target != AppState.ERROR:
@@ -990,7 +1030,21 @@ class ApplicationOrchestrator:
             autofocus_attempt=af.attempt,
             focus_before=af.focus_before,
             focus_after=af.focus_after,
-            focus_roi=af.focus_roi,
+            focus_roi=af.preview_roi or af.focus_roi,
+            lens_before=af.lens_before,
+            lens_after=af.lens_after,
+            improvement_ratio=af.improvement_ratio,
+            preview_focus_roi=af.preview_roi or af.focus_roi,
+            sensor_focus_roi=af.sensor_roi,
+            preview_roi_wh=af.preview_roi_wh,
+            document_roi="{},{},{},{}".format(*doc.document_roi) if doc.document_roi != (0, 0, 0, 0) else "",
+            stability_motion=stab.motion,
+            stability_threshold=stab.threshold,
+            state_reason=self._last_transition_reason,
+            manual_capture_requested=self._manual_capture_requested,
+            capture_started=self._capture_started,
+            upload_started=self._upload_started,
+            upload_result=self._upload_result,
         )
 
     async def _shutdown(self) -> None:

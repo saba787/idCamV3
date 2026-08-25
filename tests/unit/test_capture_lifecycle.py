@@ -118,6 +118,7 @@ class TestAutoCapturePath:
         orch = _orch(app_config)
         orch.sm.state = AppState.FOCUSING
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
         orch._check_motion_abort = AsyncMock(return_value=True)
         orch.autofocus.run_autofocus = AsyncMock(
             return_value=AutofocusResult(True, 90.0, 1, None, "hardware_cycle", 10.0)
@@ -159,6 +160,57 @@ class TestAutoCapturePath:
         with patch("idcam.app.orchestrator.asyncio.sleep", AsyncMock()):
             await orch._success_tick()
         assert orch.sm.state == AppState.WAITING_FOR_REMOVAL
+
+
+class TestIdleDoesNotStayWhenReady:
+    @pytest.mark.asyncio
+    async def test_awaiting_clear_scene_retries_when_document_still_present(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        orch._awaiting_clear_scene = True
+        orch.detector.update_baseline(_empty_frame())
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        await orch._idle_tick()
+        assert orch.sm.state == AppState.DOCUMENT_DETECTED
+        assert orch._awaiting_clear_scene is False
+        assert orch._transaction is not None
+        assert orch._transaction.trigger == "auto"
+
+
+class TestAutoDetectStableFocusCapture:
+    @pytest.mark.asyncio
+    async def test_detect_stable_focus_capture(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        orch.detector.update_baseline(_empty_frame())
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        orch.autofocus.run_autofocus = AsyncMock(
+            return_value=AutofocusResult(True, 35.0, 1, None, "hardware_trigger", 28.0, 10.0, True)
+        )
+        orch.autofocus.verify_focus = AsyncMock(
+            return_value=AutofocusResult(True, 35.0, 0, None, "verification", 28.0)
+        )
+
+        async def fake_capture(_camera, path):
+            path.write_bytes(b"\xff\xd8\xff" + b"\x00" * 500)
+            return path
+
+        orch.capture_service.capture = fake_capture
+        await orch._idle_tick()
+        assert orch.sm.state == AppState.DOCUMENT_DETECTED
+        await orch._document_detected_tick()
+        assert orch.sm.state == AppState.WAITING_FOR_STABILITY
+        for _ in range(8):
+            await orch._stability_tick()
+            if orch.sm.state == AppState.FOCUSING:
+                break
+        assert orch.sm.state == AppState.FOCUSING
+        await orch._focusing_tick()
+        assert orch.sm.state == AppState.FOCUS_VERIFICATION
+        await orch._focus_verification_tick()
+        assert orch.sm.state == AppState.CAPTURING
+        await orch._capturing_tick()
+        assert orch.sm.state == AppState.IMAGE_VALIDATION
 
 
 class TestRemovalHold:

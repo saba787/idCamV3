@@ -75,6 +75,19 @@ class TestManualCaptureCommand:
         assert orch._transaction.trigger == "manual"
         assert orch._pending_command == "manual_capture_running"
 
+    @pytest.mark.asyncio
+    async def test_manual_skips_stability_and_detection(self, app_config):
+        orch = _make_orch(app_config)
+        orch._pending_command = "manual_capture"
+        orch.detector.detect = MagicMock(return_value=False)
+        orch._safe_preview = AsyncMock(return_value=np.zeros((40, 40, 3), dtype=np.uint8))
+        await orch._idle_tick()
+        orch.detector.detect.assert_not_called()
+        assert orch.sm.state == AppState.DOCUMENT_DETECTED
+        assert orch._transaction.trigger == "manual"
+        await orch._document_detected_tick()
+        assert orch.sm.state == AppState.FOCUSING
+
     def test_busy_when_non_terminal_transaction_exists(self, app_config):
         orch = _make_orch(app_config)
         orch.sm.state = AppState.IDLE

@@ -55,6 +55,61 @@ def describe_preview_frame(frame: np.ndarray) -> dict[str, Any]:
     return info
 
 
+def parse_xywh(value: Any) -> tuple[int, int, int, int] | None:
+    """Normalize libcamera Rectangle / tuple to (x, y, width, height)."""
+    if value is None:
+        return None
+    if hasattr(value, "x") and hasattr(value, "width"):
+        return int(value.x), int(value.y), int(value.width), int(value.height)
+    try:
+        if len(value) >= 4:
+            return int(value[0]), int(value[1]), int(value[2]), int(value[3])
+    except TypeError:
+        return None
+    return None
+
+
+def map_preview_roi_to_sensor(
+    preview_roi: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+    scaler_crop: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Map a preview-pixel ROI into AfWindows / ScalerCrop coordinates.
+
+    Preview is typically 1920x1080 (16:9). The sensor/ScalerCropMaximum is
+    ~9152x6944 (≈4:3). Taking 70% of ScalerCropMaximum independently does
+    **not** match 70% of the preview. Use the live ScalerCrop of the current
+    stream so AF and Laplacian see the same document region.
+    """
+    px, py, pw, ph = (int(v) for v in preview_roi)
+    fw, fh = int(preview_size[0]), int(preview_size[1])
+    sx, sy, sw, sh = (int(v) for v in scaler_crop)
+    if fw <= 0 or fh <= 0 or sw <= 0 or sh <= 0:
+        return sx, sy, sw, sh
+    return (
+        sx + int(round(px * sw / fw)),
+        sy + int(round(py * sh / fh)),
+        max(1, int(round(pw * sw / fw))),
+        max(1, int(round(ph * sh / fh))),
+    )
+
+
+def clip_preview_roi(
+    roi: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Clip an (x, y, w, h) ROI to preview pixel bounds (width, height)."""
+    fw, fh = int(preview_size[0]), int(preview_size[1])
+    x, y, rw, rh = (int(v) for v in roi)
+    if fw <= 0 or fh <= 0:
+        return 0, 0, 1, 1
+    x = max(0, min(x, max(0, fw - 1)))
+    y = max(0, min(y, max(0, fh - 1)))
+    rw = max(1, min(rw, fw - x))
+    rh = max(1, min(rh, fh - y))
+    return x, y, rw, rh
+
+
 def normalize_picamera_preview_frame(frame: np.ndarray) -> np.ndarray:
     """Convert a Picamera2 RGB888/XRGB8888 ndarray to RGB channel order.
 
@@ -189,7 +244,7 @@ class CameraManager:
                 self._picam2.configure(self._still_config)
                 self._picam2.start()
                 if lens_position is not None:
-                    self.set_controls(
+                    self._set_controls_unlocked(
                         {
                             "AfMode": self._af_mode_manual(),
                             "LensPosition": float(lens_position),
@@ -235,68 +290,131 @@ class CameraManager:
 
     def set_controls(self, control_dict: dict[str, Any]) -> None:
         with self._lock:
-            if self._use_mock:
-                return
-            assert self._picam2 is not None
-            # Filter to only advertised controls
-            advertised = set(self._picam2.camera_controls.keys())
-            filtered = {k: v for k, v in control_dict.items() if k in advertised}
-            if not filtered:
-                logger.warning("None of controls %s are advertised", list(control_dict.keys()))
-                return
-            self._picam2.set_controls(filtered)
+            self._set_controls_unlocked(control_dict)
 
-    def autofocus_cycle(self) -> bool:
+    def _set_controls_unlocked(self, control_dict: dict[str, Any]) -> None:
+        if self._use_mock:
+            return
+        assert self._picam2 is not None
+        advertised = set(self._picam2.camera_controls.keys())
+        filtered = {k: v for k, v in control_dict.items() if k in advertised}
+        if not filtered:
+            logger.warning("None of controls %s are advertised", list(control_dict.keys()))
+            return
+        self._picam2.set_controls(filtered)
+
+    def current_scaler_crop(self) -> tuple[int, int, int, int]:
+        """Live stream crop on the sensor, else ScalerCropMaximum, else preview size."""
+        with self._lock:
+            return self._current_scaler_crop_unlocked()
+
+    def _current_scaler_crop_unlocked(self) -> tuple[int, int, int, int]:
+        fallback = (0, 0, int(self.config.preview_width), int(self.config.preview_height))
+        if self._use_mock or self._picam2 is None:
+            return fallback
+        try:
+            meta = dict(self._picam2.capture_metadata())
+        except Exception:
+            meta = {}
+        crop = parse_xywh(meta.get("ScalerCrop"))
+        if crop is None:
+            props = getattr(self._picam2, "camera_properties", None) or {}
+            crop = parse_xywh(props.get("ScalerCropMaximum"))
+        return crop or fallback
+
+    def apply_document_focus_window(
+        self,
+        preview_roi: tuple[int, int, int, int],
+        preview_size: tuple[int, int],
+    ) -> dict[str, Any]:
+        """Point hardware AF at a preview-pixel ROI mapped through live ScalerCrop."""
+        with self._lock:
+            fw, fh = int(preview_size[0]), int(preview_size[1])
+            clipped = clip_preview_roi(preview_roi, (fw, fh))
+            scaler = self._current_scaler_crop_unlocked()
+            sensor = map_preview_roi_to_sensor(clipped, (fw, fh), scaler)
+            if not self._use_mock and self._picam2 is not None:
+                x, y, w, h = sensor
+                self._set_controls_unlocked(
+                    {
+                        "AfMetering": self._af_metering_windows(),
+                        "AfWindows": [(int(x), int(y), int(w), int(h))],
+                        "AfRange": self._af_range_full(),
+                    }
+                )
+            logger.info(
+                "event=autofocus_roi preview=%d,%d,%d,%d preview_size=%dx%d "
+                "scaler_crop=%d,%d,%d,%d sensor=%d,%d,%d,%d",
+                clipped[0],
+                clipped[1],
+                clipped[2],
+                clipped[3],
+                preview_size[0],
+                preview_size[1],
+                *scaler,
+                *sensor,
+            )
+            return {
+                "preview_roi": clipped,
+                "preview_size": (fw, fh),
+                "scaler_crop": scaler,
+                "sensor_roi": sensor,
+            }
+
+    def trigger_autofocus(self) -> None:
+        """Start a one-shot Auto cycle. Do not wait on AfState (often unavailable)."""
         with self._lock:
             if self._use_mock:
-                time.sleep(0.2)
-                return True
+                return
             assert self._picam2 is not None
-            self.set_controls(
+            # Do not call picam2.autofocus_cycle(): with AfState unadvertised it
+            # often returns immediately, and a blocking wait holds the camera lock.
+            self._set_controls_unlocked(
                 {
                     "AfMode": self._af_mode_auto(),
                     "AfSpeed": self._af_speed_fast(),
                     "AfRange": self._af_range_full(),
+                    "AfTrigger": self._af_trigger_start(),
                 }
             )
-            if hasattr(self._picam2, "autofocus_cycle"):
-                result = self._picam2.autofocus_cycle()
-                return True if result is None else bool(result)
-            self.set_controls({"AfMode": self._af_mode_auto(), "AfTrigger": self._af_trigger_start()})
-            return True
+            logger.info("event=autofocus_triggered method=af_controls AfMode=Auto AfTrigger=Start wait=lens_settle")
 
-    def apply_document_focus_window(self, roi_fraction: float) -> tuple[int, int, int, int]:
-        """Point hardware AF at the centered document ROI (ScalerCropMaximum coords)."""
-        with self._lock:
-            window = self._sensor_roi_from_preview_fraction(roi_fraction)
-            if self._use_mock or self._picam2 is None:
-                return window
-            x, y, w, h = window
-            self.set_controls(
-                {
-                    "AfMetering": self._af_metering_windows(),
-                    "AfWindows": [(int(x), int(y), int(w), int(h))],
-                    "AfRange": self._af_range_full(),
-                }
-            )
-            logger.info("event=autofocus_roi window=%d,%d,%d,%d", x, y, w, h)
-            return window
+    def wait_for_lens_settle(self, timeout_sec: float) -> float | None:
+        """Wait until LensPosition stops changing. AfState is not required."""
+        if self._use_mock:
+            time.sleep(0.05)
+            return 1.0
+        deadline = time.monotonic() + max(0.4, float(timeout_sec))
+        time.sleep(0.25)
+        last: float | None = None
+        stable = 0
+        while time.monotonic() < deadline:
+            meta = self.capture_metadata()
+            raw = meta.get("LensPosition")
+            try:
+                lens = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                lens = None
+            if lens is None:
+                time.sleep(0.1)
+                continue
+            if last is not None and abs(lens - last) < 0.05:
+                stable += 1
+                if stable >= 3:
+                    logger.info("event=autofocus_result method=lens_settle lens_position=%s", lens)
+                    return lens
+            else:
+                stable = 0
+            last = lens
+            time.sleep(0.1)
+        logger.info("event=autofocus_result method=lens_settle_timeout lens_position=%s", last)
+        return last
 
-    def _sensor_roi_from_preview_fraction(self, roi_fraction: float) -> tuple[int, int, int, int]:
-        frac = min(max(float(roi_fraction), 0.05), 1.0)
-        crop = None
-        if self._picam2 is not None:
-            props = getattr(self._picam2, "camera_properties", None) or {}
-            crop = props.get("ScalerCropMaximum")
-        if crop is None or len(crop) < 4:
-            sw, sh = int(self.config.preview_width), int(self.config.preview_height)
-            ox = oy = 0
-        else:
-            ox, oy, sw, sh = int(crop[0]), int(crop[1]), int(crop[2]), int(crop[3])
-        rw, rh = max(1, int(sw * frac)), max(1, int(sh * frac))
-        x = ox + (sw - rw) // 2
-        y = oy + (sh - rh) // 2
-        return x, y, rw, rh
+    def autofocus_cycle(self) -> bool:
+        """Trigger AF and wait for the lens to settle (not AfState)."""
+        self.trigger_autofocus()
+        self.wait_for_lens_settle(min(float(self.config.af_timeout_sec), 3.0))
+        return True
 
     def pause_autofocus(self) -> None:
         """Lock the current lens position so Continuous AF does not hunt during still capture."""
@@ -305,12 +423,12 @@ class CameraManager:
                 return
             advertised = self._picam2.camera_controls
             if "AfPause" in advertised:
-                self.set_controls({"AfPause": 0})
+                self._set_controls_unlocked({"AfPause": 0})
                 logger.info("event=autofocus_triggered method=pause")
             elif "AfMode" in advertised and "LensPosition" in advertised:
                 lens = self._read_lens_position()
                 if lens is not None:
-                    self.set_controls({"AfMode": self._af_mode_manual(), "LensPosition": lens})
+                    self._set_controls_unlocked({"AfMode": self._af_mode_manual(), "LensPosition": lens})
                     logger.info("event=autofocus_result method=hold_lens_position lens_position=%s", lens)
 
     def _af_enum(self, group: str, name: str, fallback: int) -> int:

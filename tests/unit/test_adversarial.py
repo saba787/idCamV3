@@ -100,6 +100,7 @@ class TestOneShotStates:
             return AutofocusResult(True, 100.0, 1, 2, "test", 10.0)
 
         orch.autofocus.run_autofocus = counting_af
+        orch._safe_preview = AsyncMock(return_value=np.zeros((40, 40, 3), dtype=np.uint8))
         orch._check_motion_abort = AsyncMock(return_value=True)
 
         orch._state_action_claimed = AppState.FOCUSING
@@ -130,18 +131,22 @@ class TestActiveTransactionGuard:
 
 class TestMotionDuringCapture:
     @pytest.mark.asyncio
-    async def test_motion_during_focus_aborts(self, app_config):
+    async def test_lens_motion_during_focus_does_not_abort(self, app_config):
         orch = _make_orch(app_config)
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-move")
         orch.sm.state = AppState.FOCUSING
         orch.detector.classify = MagicMock(return_value=__import__(
             "idcam.vision.document_detector", fromlist=["DocumentPresence"]
         ).DocumentPresence.DOCUMENT_MOVING)
+        orch.autofocus.run_autofocus = AsyncMock(
+            return_value=AutofocusResult(True, 30.0, 1, None, "hardware_trigger", 28.0)
+        )
+        orch._safe_preview = AsyncMock(return_value=np.zeros((10, 10, 3), dtype=np.uint8))
 
         with patch.object(orch, "_fail_transaction_and_wait", AsyncMock()) as fail_mock:
-            orch._safe_preview = AsyncMock(return_value=np.zeros((10, 10, 3), dtype=np.uint8))
             await orch._focusing_tick()
-            fail_mock.assert_called_once()
+            fail_mock.assert_not_called()
+        assert orch.sm.state == AppState.FOCUS_VERIFICATION
 
 
 class TestShutdown:

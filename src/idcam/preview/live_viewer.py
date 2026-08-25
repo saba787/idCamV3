@@ -70,6 +70,20 @@ class DebugSnapshot:
     focus_before: float = 0.0
     focus_after: float = 0.0
     focus_roi: str = ""
+    lens_before: float | None = None
+    lens_after: float | None = None
+    improvement_ratio: float = 0.0
+    preview_focus_roi: str = ""
+    sensor_focus_roi: str = ""
+    preview_roi_wh: str = ""
+    document_roi: str = ""
+    stability_motion: float = 0.0
+    stability_threshold: float = 0.0
+    state_reason: str = ""
+    manual_capture_requested: bool = False
+    capture_started: bool = False
+    upload_started: bool = False
+    upload_result: str = ""
 
 
 class LiveFrameBuffer:
@@ -143,9 +157,9 @@ def encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
 
 def _draw_panel(image: np.ndarray, lines: list[str], *, banner: str | None = None) -> None:
     overlay = image.copy()
-    line_h = 28
+    line_h = 22
     pad = 12
-    panel_w = 520
+    panel_w = 620
     panel_h = pad * 2 + line_h * len(lines)
     if banner:
         panel_h += line_h + 8
@@ -190,6 +204,10 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     rh, rw = int(h * frac), int(w * frac)
     y0, x0 = (h - rh) // 2, (w - rw) // 2
     cv2.rectangle(debug_frame, (x0, y0), (x0 + rw, y0 + rh), (0, 220, 80), 2)
+    doc_roi = _parse_roi(snapshot.document_roi or snapshot.preview_focus_roi or snapshot.focus_roi)
+    if doc_roi is not None:
+        dx, dy, dw, dh = doc_roi
+        cv2.rectangle(debug_frame, (dx, dy), (dx + dw, dy + dh), (80, 180, 255), 2)
 
     camera = "OK" if snapshot.camera_healthy else "ERROR"
     if not snapshot.camera_healthy and snapshot.waiting_for_camera and not snapshot.camera_error:
@@ -212,10 +230,15 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         f"ROI: {snapshot.roi_width}x{snapshot.roi_height}",
         f"FRAME: {snapshot.frame_width}x{snapshot.frame_height}",
         f"FRAME MOTION: {snapshot.frame_motion:.2f}",
-        f"STABLE: {snapshot.stable_count}/{snapshot.stable_required}",
+        f"STABLE: {snapshot.stable_count}/{snapshot.stable_required} motion={snapshot.stability_motion:.2f}/{snapshot.stability_threshold:.2f}",
         f"REMOVAL: {snapshot.removal_count} empty={snapshot.removal_detected}",
         f"AF: {snapshot.autofocus_method or '-'} att={snapshot.autofocus_attempt}",
-        f"FOCUS: {snapshot.focus_before:.0f}->{snapshot.focus_after:.0f}",
+        f"FOCUS: {snapshot.focus_before:.1f}->{snapshot.focus_after:.1f} x{snapshot.improvement_ratio:.2f}",
+        f"LENS: {snapshot.lens_before}->{snapshot.lens_after}",
+        f"PREVIEW ROI: {snapshot.preview_focus_roi or snapshot.focus_roi or '-'}",
+        f"SENSOR ROI: {snapshot.sensor_focus_roi or '-'}",
+        f"REASON: {snapshot.state_reason or '-'}",
+        f"MANUAL: req={snapshot.manual_capture_requested} cap={snapshot.capture_started} up={snapshot.upload_started} {snapshot.upload_result or '-'}",
         f"FPS: {fps:.1f}",
         f"CAMERA: {camera}",
     ]
@@ -224,6 +247,21 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         lines.append(f"DETAIL: {err}")
     _draw_panel(debug_frame, lines, banner=banner)
     return debug_frame
+
+
+def _parse_roi(value: str) -> tuple[int, int, int, int] | None:
+    if not value or "," not in value:
+        return None
+    parts = value.replace(" ", "").split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        x, y, w, h = (int(float(p)) for p in parts)
+    except ValueError:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
 
 
 def make_placeholder(message: str) -> np.ndarray:
@@ -293,9 +331,16 @@ _HTML_PAGE = """<!DOCTYPE html>
         <dt>Frame</dt><dd id="frame">—</dd>
         <dt>Gray std</dt><dd id="graystd">—</dd>
         <dt>Stable frames</dt><dd id="stable">—</dd>
+        <dt>Stability motion</dt><dd id="stabmotion">—</dd>
         <dt>Removal</dt><dd id="removal">—</dd>
         <dt>Autofocus</dt><dd id="af">—</dd>
-        <dt>Focus ROI</dt><dd id="focusroi">—</dd>
+        <dt>Focus ROI (preview)</dt><dd id="focusroi">—</dd>
+        <dt>Sensor AF ROI</dt><dd id="sensorroi">—</dd>
+        <dt>Document ROI</dt><dd id="docroi">—</dd>
+        <dt>Lens</dt><dd id="lens">—</dd>
+        <dt>Sharpness ratio</dt><dd id="ratio">—</dd>
+        <dt>State reason</dt><dd id="reason">—</dd>
+        <dt>Capture / upload</dt><dd id="pipeline">—</dd>
         <dt>FPS</dt><dd id="fps">—</dd>
         <dt>Timestamp</dt><dd id="timestamp">—</dd>
       </dl>
@@ -342,9 +387,16 @@ _HTML_PAGE = """<!DOCTYPE html>
         el("frame").textContent = shape + " " + (fr.dtype || "") + " " + (fr.channel_order || "");
         el("graystd").textContent = Number(d.gray_std || 0).toFixed(2);
         el("stable").textContent = (d.stable_count ?? 0) + " / " + (d.stable_required ?? 0);
+        el("stabmotion").textContent = Number(d.stability_motion || 0).toFixed(2) + " / " + Number(d.stability_threshold || 0).toFixed(2);
         el("removal").textContent = (d.removal_detected ? "empty" : "document still present") + " (" + (d.removal_count ?? 0) + ")";
-        el("af").textContent = (d.autofocus_method || "—") + " " + Number(d.focus_before || 0).toFixed(0) + "→" + Number(d.focus_after || 0).toFixed(0);
-        el("focusroi").textContent = d.focus_roi || "—";
+        el("af").textContent = (d.autofocus_method || "—") + " " + Number(d.focus_before || 0).toFixed(1) + "→" + Number(d.focus_after || 0).toFixed(1);
+        el("focusroi").textContent = d.preview_focus_roi || d.focus_roi || "—";
+        el("sensorroi").textContent = d.sensor_focus_roi || "—";
+        el("docroi").textContent = d.document_roi || "—";
+        el("lens").textContent = (d.lens_before == null ? "—" : Number(d.lens_before).toFixed(2)) + " → " + (d.lens_after == null ? "—" : Number(d.lens_after).toFixed(2));
+        el("ratio").textContent = Number(d.improvement_ratio || 0).toFixed(2);
+        el("reason").textContent = d.state_reason || "—";
+        el("pipeline").textContent = "manual=" + (d.manual_capture_requested ? "yes" : "no") + " capture=" + (d.capture_started ? "yes" : "no") + " upload=" + (d.upload_started ? "yes" : "no") + " " + (d.upload_result || "—");
         el("fps").textContent = Number(d.fps).toFixed(1);
         const ts = d.timestamp ? new Date(d.timestamp * 1000).toISOString() : "—";
         el("timestamp").textContent = ts;
@@ -665,6 +717,20 @@ class LiveDebugViewer:
         focus_before: float = 0.0,
         focus_after: float = 0.0,
         focus_roi: str = "",
+        lens_before: float | None = None,
+        lens_after: float | None = None,
+        improvement_ratio: float = 0.0,
+        preview_focus_roi: str = "",
+        sensor_focus_roi: str = "",
+        preview_roi_wh: str = "",
+        document_roi: str = "",
+        stability_motion: float = 0.0,
+        stability_threshold: float = 0.0,
+        state_reason: str = "",
+        manual_capture_requested: bool = False,
+        capture_started: bool = False,
+        upload_started: bool = False,
+        upload_result: str = "",
     ) -> None:
         """Store the latest preview copy and metadata. Never blocks on HTTP clients."""
         with self._meta_lock:
@@ -712,7 +778,21 @@ class LiveDebugViewer:
                 autofocus_attempt=autofocus_attempt,
                 focus_before=focus_before,
                 focus_after=focus_after,
-                focus_roi=focus_roi,
+                focus_roi=preview_focus_roi or focus_roi,
+                lens_before=lens_before,
+                lens_after=lens_after,
+                improvement_ratio=improvement_ratio,
+                preview_focus_roi=preview_focus_roi or focus_roi,
+                sensor_focus_roi=sensor_focus_roi,
+                preview_roi_wh=preview_roi_wh,
+                document_roi=document_roi,
+                stability_motion=stability_motion,
+                stability_threshold=stability_threshold,
+                state_reason=state_reason,
+                manual_capture_requested=manual_capture_requested,
+                capture_started=capture_started,
+                upload_started=upload_started,
+                upload_result=upload_result,
             )
 
     def snapshot_meta(self) -> DebugSnapshot:
@@ -763,7 +843,21 @@ class LiveDebugViewer:
             "autofocus_attempt": snap.autofocus_attempt,
             "focus_before": snap.focus_before,
             "focus_after": snap.focus_after,
-            "focus_roi": snap.focus_roi,
+            "focus_roi": snap.preview_focus_roi or snap.focus_roi,
+            "lens_before": snap.lens_before,
+            "lens_after": snap.lens_after,
+            "improvement_ratio": snap.improvement_ratio,
+            "preview_focus_roi": snap.preview_focus_roi or snap.focus_roi,
+            "sensor_focus_roi": snap.sensor_focus_roi,
+            "preview_roi_wh": snap.preview_roi_wh,
+            "document_roi": snap.document_roi,
+            "stability_motion": snap.stability_motion,
+            "stability_threshold": snap.stability_threshold,
+            "state_reason": snap.state_reason,
+            "manual_capture_requested": snap.manual_capture_requested,
+            "capture_started": snap.capture_started,
+            "upload_started": snap.upload_started,
+            "upload_result": snap.upload_result,
         }
 
     def wait_jpeg(self, last_seq: int, timeout: float) -> tuple[int, bytes | None]:

@@ -65,6 +65,11 @@ class StabilityDetector:
 
         if motion < self.config.motion_threshold:
             self._stable_count += 1
+        elif self._stable_count >= self.config.stable_frames_required and motion <= self.config.motion_threshold * 1.5:
+            # Hold a latched stable document through small AE / preview noise.
+            pass
+        elif motion <= self.config.motion_threshold * 1.5:
+            self._stable_count = max(0, self._stable_count - 1)
         else:
             self._stable_count = 0
 

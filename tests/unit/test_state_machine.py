@@ -56,6 +56,17 @@ class TestStateMachine:
         ]:
             sm.transition(target)
 
+    def test_manual_skips_stability(self):
+        sm = StateMachine(state=AppState.IDLE)
+        sm.transition(AppState.DOCUMENT_DETECTED)
+        sm.transition(AppState.FOCUSING)
+        assert sm.state == AppState.FOCUSING
+
+    def test_idle_can_go_directly_to_focusing(self):
+        sm = StateMachine(state=AppState.IDLE)
+        sm.transition(AppState.FOCUSING)
+        assert sm.state == AppState.FOCUSING
+
     def test_recovery_from_focusing(self):
         sm = StateMachine(state=AppState.FOCUSING)
         sm.transition(AppState.RECOVERY)

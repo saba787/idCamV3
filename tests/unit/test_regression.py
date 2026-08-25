@@ -108,6 +108,7 @@ class TestOneShotRegression:
             return AutofocusResult(True, 100.0, 1, 2, "test", 10.0)
 
         orch.autofocus.run_autofocus = counting_af
+        orch._safe_preview = AsyncMock(return_value=np.zeros((40, 40, 3), dtype=np.uint8))
         await orch._focusing_tick()
         assert call_count == 2
 

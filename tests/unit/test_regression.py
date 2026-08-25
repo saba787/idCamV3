@@ -76,9 +76,9 @@ class TestTransactionLifecycleRegression:
         orch = _make_orch(app_config)
         orch.sm.state = AppState.WAITING_FOR_REMOVAL
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-rem")
-        orch._transaction.mark_failed("upload_failed")
-        assert orch.has_active_transaction
-        assert orch.sm.in_transaction()
+        orch._transaction.mark_completed()
+        assert not orch.has_active_transaction
+        assert not orch.sm.in_transaction()
 
 
 class TestOneShotRegression:
@@ -136,9 +136,8 @@ class TestNetworkRegression:
 
         await orch._waiting_server_tick()
         await orch._processing_response_tick()
-        assert orch.sm.state == AppState.WAITING_FOR_REMOVAL
-        assert orch._transaction.is_terminal
-        assert orch._transaction.failure_reason == "read timeout"
+        assert orch.sm.state == AppState.IDLE
+        assert orch._transaction is None
 
     @pytest.mark.asyncio
     @respx.mock

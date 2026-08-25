@@ -32,6 +32,8 @@ _AF_MODE_CONTINUOUS = 2
 _AF_TRIGGER_START = 0
 _AF_STATE_FOCUSED = 2
 _AF_STATE_FAILED = 3
+_AF_METERING_WINDOWS = 1
+_AF_RANGE_FULL = 2
 
 
 def describe_preview_frame(frame: np.ndarray) -> dict[str, Any]:
@@ -250,12 +252,51 @@ class CameraManager:
                 time.sleep(0.2)
                 return True
             assert self._picam2 is not None
-            self.set_controls({"AfSpeed": self._af_speed_fast()})
+            self.set_controls(
+                {
+                    "AfMode": self._af_mode_auto(),
+                    "AfSpeed": self._af_speed_fast(),
+                    "AfRange": self._af_range_full(),
+                }
+            )
             if hasattr(self._picam2, "autofocus_cycle"):
                 result = self._picam2.autofocus_cycle()
                 return True if result is None else bool(result)
             self.set_controls({"AfMode": self._af_mode_auto(), "AfTrigger": self._af_trigger_start()})
             return True
+
+    def apply_document_focus_window(self, roi_fraction: float) -> tuple[int, int, int, int]:
+        """Point hardware AF at the centered document ROI (ScalerCropMaximum coords)."""
+        with self._lock:
+            window = self._sensor_roi_from_preview_fraction(roi_fraction)
+            if self._use_mock or self._picam2 is None:
+                return window
+            x, y, w, h = window
+            self.set_controls(
+                {
+                    "AfMetering": self._af_metering_windows(),
+                    "AfWindows": [(int(x), int(y), int(w), int(h))],
+                    "AfRange": self._af_range_full(),
+                }
+            )
+            logger.info("event=autofocus_roi window=%d,%d,%d,%d", x, y, w, h)
+            return window
+
+    def _sensor_roi_from_preview_fraction(self, roi_fraction: float) -> tuple[int, int, int, int]:
+        frac = min(max(float(roi_fraction), 0.05), 1.0)
+        crop = None
+        if self._picam2 is not None:
+            props = getattr(self._picam2, "camera_properties", None) or {}
+            crop = props.get("ScalerCropMaximum")
+        if crop is None or len(crop) < 4:
+            sw, sh = int(self.config.preview_width), int(self.config.preview_height)
+            ox = oy = 0
+        else:
+            ox, oy, sw, sh = int(crop[0]), int(crop[1]), int(crop[2]), int(crop[3])
+        rw, rh = max(1, int(sw * frac)), max(1, int(sh * frac))
+        x = ox + (sw - rw) // 2
+        y = oy + (sh - rh) // 2
+        return x, y, rw, rh
 
     def pause_autofocus(self) -> None:
         """Lock the current lens position so Continuous AF does not hunt during still capture."""
@@ -295,6 +336,12 @@ class CameraManager:
 
     def _af_speed_fast(self) -> int:
         return self._af_enum("AfSpeedEnum", "Fast", 1)
+
+    def _af_metering_windows(self) -> int:
+        return self._af_enum("AfMeteringEnum", "Windows", _AF_METERING_WINDOWS)
+
+    def _af_range_full(self) -> int:
+        return self._af_enum("AfRangeEnum", "Full", _AF_RANGE_FULL)
 
     def _af_mode_max(self) -> int | None:
         if self._picam2 is None:

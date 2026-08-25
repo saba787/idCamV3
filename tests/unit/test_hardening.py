@@ -69,8 +69,11 @@ class TestTransactionContext:
 class TestSameDocumentProtection:
     def test_removal_required_before_idle(self):
         sm = StateMachine(state=AppState.WAITING_FOR_REMOVAL)
-        assert sm.in_transaction()
+        assert not sm.in_transaction()
         assert sm.timeout_for_state() is None
+        assert sm.can_transition(AppState.DOCUMENT_DETECTED)
+        assert sm.can_transition(AppState.IDLE)
+        assert not sm.can_transition(AppState.CAPTURING)
 
     def test_no_idle_escape_on_removal_timeout(self, app_config):
         sm = StateMachine(state=AppState.WAITING_FOR_REMOVAL)

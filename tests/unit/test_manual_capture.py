@@ -15,6 +15,7 @@ from idcam.app.transaction import ActiveCaptureTransaction
 from idcam.camera.autofocus import AutofocusResult
 from idcam.config.schema import AppConfig, CameraConfig, DetectionConfig, QualityConfig, ServerConfig, UIConfig
 from idcam.network.protocol import ServerResponse, UploadOutcome
+from idcam.system.component_health import ComponentStatus, HealthLevel
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ def app_config(tmp_path):
 def _make_orch(app_config):
     orch = ApplicationOrchestrator(app_config, use_mock_camera=True)
     orch.sm.state = AppState.IDLE
-    orch.health.camera.details = {"healthy": True}
+    orch.health.camera = ComponentStatus(level=HealthLevel.HEALTHY, details={"healthy": True})
     return orch
 
 
@@ -125,6 +126,7 @@ class TestManualCaptureCommand:
         assert orch._command_event.is_set()
         assert orch._command_result["ok"] is False
         assert "upload_failed" in orch._command_result["message"]
+        assert orch.sm.state == AppState.IDLE
 
     @pytest.mark.asyncio
     async def test_end_to_end_manual_capture_upload(self, app_config, tmp_path):
@@ -189,3 +191,18 @@ class TestManualCaptureCommand:
         assert results[0]["status"] == "success"
         assert called["n"] == 1
         orch.camera.shutdown()
+
+    def test_button_enabled_during_waiting_for_removal(self, app_config):
+        orch = _make_orch(app_config)
+        orch.sm.state = AppState.WAITING_FOR_REMOVAL
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
+        orch._transaction.mark_completed()
+        available, _phase, _msg = orch._manual_status()
+        assert available is True
+
+    def test_button_disabled_while_focusing(self, app_config):
+        orch = _make_orch(app_config)
+        orch.sm.state = AppState.FOCUSING
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-x")
+        available, _phase, _msg = orch._manual_status()
+        assert available is False

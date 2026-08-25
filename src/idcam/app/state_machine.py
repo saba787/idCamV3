@@ -35,6 +35,20 @@ class AppState(str, Enum):
     SHUTDOWN = "SHUTDOWN"
 
 
+# Active capture/upload — not IDLE and not the post-success removal hold.
+CAPTURE_IN_PROGRESS_STATES = {
+    AppState.DOCUMENT_DETECTED,
+    AppState.WAITING_FOR_STABILITY,
+    AppState.FOCUSING,
+    AppState.FOCUS_VERIFICATION,
+    AppState.CAPTURING,
+    AppState.IMAGE_VALIDATION,
+    AppState.UPLOADING,
+    AppState.WAITING_FOR_SERVER,
+    AppState.PROCESSING_RESPONSE,
+    AppState.SUCCESS,
+}
+
 # States with no timeout (must not block forever via watchdog elsewhere)
 NO_TIMEOUT_STATES = {
     AppState.CAMERA_READY,
@@ -51,15 +65,20 @@ ALLOWED_TRANSITIONS: dict[AppState, set[AppState]] = {
     AppState.IDLE: {AppState.DOCUMENT_DETECTED, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
     AppState.DOCUMENT_DETECTED: {AppState.WAITING_FOR_STABILITY, AppState.IDLE, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
     AppState.WAITING_FOR_STABILITY: {AppState.FOCUSING, AppState.IDLE, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.FOCUSING: {AppState.FOCUS_VERIFICATION, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
-    AppState.FOCUS_VERIFICATION: {AppState.CAPTURING, AppState.FOCUSING, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.CAPTURING: {AppState.IMAGE_VALIDATION, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.IMAGE_VALIDATION: {AppState.UPLOADING, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.UPLOADING: {AppState.WAITING_FOR_SERVER, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.WAITING_FOR_SERVER: {AppState.PROCESSING_RESPONSE, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
-    AppState.PROCESSING_RESPONSE: {AppState.SUCCESS, AppState.WAITING_FOR_REMOVAL, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.FOCUSING: {AppState.FOCUS_VERIFICATION, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.ERROR, AppState.SHUTDOWN},
+    AppState.FOCUS_VERIFICATION: {AppState.CAPTURING, AppState.FOCUSING, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.CAPTURING: {AppState.IMAGE_VALIDATION, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.IMAGE_VALIDATION: {AppState.UPLOADING, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.UPLOADING: {AppState.WAITING_FOR_SERVER, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.WAITING_FOR_SERVER: {AppState.PROCESSING_RESPONSE, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.PROCESSING_RESPONSE: {AppState.SUCCESS, AppState.WAITING_FOR_REMOVAL, AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
     AppState.SUCCESS: {AppState.WAITING_FOR_REMOVAL, AppState.SHUTDOWN},
-    AppState.WAITING_FOR_REMOVAL: {AppState.IDLE, AppState.RECOVERY, AppState.SHUTDOWN},
+    AppState.WAITING_FOR_REMOVAL: {
+        AppState.IDLE,
+        AppState.DOCUMENT_DETECTED,
+        AppState.RECOVERY,
+        AppState.SHUTDOWN,
+    },
     AppState.RECOVERY: {AppState.CAMERA_INITIALIZING, AppState.CAMERA_READY, AppState.IDLE, AppState.ERROR, AppState.SHUTDOWN},
     AppState.ERROR: {AppState.RECOVERY, AppState.SHUTDOWN},
     AppState.SHUTDOWN: set(),
@@ -119,18 +138,8 @@ class StateMachine:
         return self.elapsed() > timeout
 
     def in_transaction(self) -> bool:
-        """True when a capture transaction is active."""
-        transactional = {
-            AppState.DOCUMENT_DETECTED,
-            AppState.WAITING_FOR_STABILITY,
-            AppState.FOCUSING,
-            AppState.FOCUS_VERIFICATION,
-            AppState.CAPTURING,
-            AppState.IMAGE_VALIDATION,
-            AppState.UPLOADING,
-            AppState.WAITING_FOR_SERVER,
-            AppState.PROCESSING_RESPONSE,
-            AppState.SUCCESS,
-            AppState.WAITING_FOR_REMOVAL,
-        }
-        return self.state in transactional
+        """True while a capture/upload is running.
+
+        WAITING_FOR_REMOVAL is a post-success hold, not an active capture.
+        """
+        return self.state in CAPTURE_IN_PROGRESS_STATES

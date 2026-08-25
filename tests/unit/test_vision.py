@@ -114,6 +114,21 @@ class TestDocumentDetectionDebug:
         still = detector.classify(doc)
         assert still != DocumentPresence.DOCUMENT_MOVING
 
+    def test_textured_empty_table_is_scene_empty(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        yy, xx = np.indices((240, 320))
+        table = np.stack(
+            [
+                (80 + (xx % 16)).astype(np.uint8),
+                (70 + (yy % 16)).astype(np.uint8),
+                np.full((240, 320), 60, dtype=np.uint8),
+            ],
+            axis=-1,
+        )
+        detector.update_baseline(table)
+        assert detector.is_scene_empty(table)
+        assert detector.last_edge_density > 0.0
+
     def test_mild_defocus_has_gradient_edges(self, detection_config):
         sharp = np.full((240, 320, 3), 200, dtype=np.uint8)
         sharp[40:200, 40:280] = 40

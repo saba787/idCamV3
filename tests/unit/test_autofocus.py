@@ -53,6 +53,12 @@ class FakeCamera:
     def set_controls(self, controls: dict[str, Any]) -> None:
         self.set_calls.append(dict(controls))
 
+    def apply_document_focus_window(self, roi_fraction: float) -> tuple[int, int, int, int]:
+        h, w = 120, 160
+        frac = roi_fraction
+        rw, rh = int(w * frac), int(h * frac)
+        return (w - rw) // 2, (h - rh) // 2, rw, rh
+
     def autofocus_cycle(self) -> Any:
         if not self.has_cycle:
             raise AssertionError("autofocus_cycle should not be called")
@@ -65,14 +71,16 @@ class FakeCamera:
 
 class TestAutofocusController:
     @pytest.mark.asyncio
-    async def test_already_sharp_skips_hardware_cycle(self):
+    async def test_sharp_preview_still_runs_hardware_cycle(self):
+        """Do not skip AF because the full/ROI preview already looks sharp."""
         camera = FakeCamera()
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
         ctl.probe_capabilities(camera)
         result = await ctl.run_autofocus(camera, sharpness_threshold=1.0)
         assert result.success is True
-        assert result.method == "already_sharp"
-        assert camera.cycle_calls == 0
+        assert camera.cycle_calls == 1
+        assert result.method == "hardware_cycle"
+        assert result.roi[2] > 0
 
     @pytest.mark.asyncio
     async def test_prefers_autofocus_cycle_when_not_yet_sharp(self):
@@ -88,7 +96,9 @@ class TestAutofocusController:
         result = await ctl.run_autofocus(camera, sharpness_threshold=1.0)
         assert result.success is True
         assert camera.cycle_calls == 1
-        assert result.method == "autofocus_cycle"
+        assert result.method == "hardware_cycle"
+        assert result.improved is True
+        assert result.sharpness >= 1.0
 
     @pytest.mark.asyncio
     async def test_wait_reads_af_state_from_metadata_not_control_ranges(self):
@@ -147,6 +157,6 @@ class TestAutofocusController:
         camera = Blurry()
         ctl = AutofocusController(CameraConfig(af_max_retries=2, af_timeout_sec=1.0))
         ctl.probe_capabilities(camera)
-        with pytest.raises(AutofocusError, match="did not reach sharpness"):
+        with pytest.raises(AutofocusError, match="did not reach"):
             await ctl.run_autofocus(camera, sharpness_threshold=500.0)
         assert camera.cycle_calls == 2

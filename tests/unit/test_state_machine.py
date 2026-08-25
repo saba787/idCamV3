@@ -84,6 +84,8 @@ class TestStateMachine:
         assert sm.in_transaction()
         sm = StateMachine(state=AppState.IDLE)
         assert not sm.in_transaction()
+        sm = StateMachine(state=AppState.WAITING_FOR_REMOVAL)
+        assert not sm.in_transaction()
 
     def test_touch_progress_does_not_reset_state_elapsed(self, timeouts):
         sm = StateMachine(state=AppState.CAPTURING)

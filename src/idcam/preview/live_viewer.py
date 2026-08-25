@@ -62,6 +62,14 @@ class DebugSnapshot:
     manual_capture_available: bool = False
     manual_phase: str = "idle"
     manual_message: str = ""
+    removal_detected: bool = False
+    removal_count: int = 0
+    autofocus_running: bool = False
+    autofocus_method: str = ""
+    autofocus_attempt: int = 0
+    focus_before: float = 0.0
+    focus_after: float = 0.0
+    focus_roi: str = ""
 
 
 class LiveFrameBuffer:
@@ -205,6 +213,9 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         f"FRAME: {snapshot.frame_width}x{snapshot.frame_height}",
         f"FRAME MOTION: {snapshot.frame_motion:.2f}",
         f"STABLE: {snapshot.stable_count}/{snapshot.stable_required}",
+        f"REMOVAL: {snapshot.removal_count} empty={snapshot.removal_detected}",
+        f"AF: {snapshot.autofocus_method or '-'} att={snapshot.autofocus_attempt}",
+        f"FOCUS: {snapshot.focus_before:.0f}->{snapshot.focus_after:.0f}",
         f"FPS: {fps:.1f}",
         f"CAMERA: {camera}",
     ]
@@ -282,6 +293,9 @@ _HTML_PAGE = """<!DOCTYPE html>
         <dt>Frame</dt><dd id="frame">—</dd>
         <dt>Gray std</dt><dd id="graystd">—</dd>
         <dt>Stable frames</dt><dd id="stable">—</dd>
+        <dt>Removal</dt><dd id="removal">—</dd>
+        <dt>Autofocus</dt><dd id="af">—</dd>
+        <dt>Focus ROI</dt><dd id="focusroi">—</dd>
         <dt>FPS</dt><dd id="fps">—</dd>
         <dt>Timestamp</dt><dd id="timestamp">—</dd>
       </dl>
@@ -328,6 +342,9 @@ _HTML_PAGE = """<!DOCTYPE html>
         el("frame").textContent = shape + " " + (fr.dtype || "") + " " + (fr.channel_order || "");
         el("graystd").textContent = Number(d.gray_std || 0).toFixed(2);
         el("stable").textContent = (d.stable_count ?? 0) + " / " + (d.stable_required ?? 0);
+        el("removal").textContent = (d.removal_detected ? "empty" : "document still present") + " (" + (d.removal_count ?? 0) + ")";
+        el("af").textContent = (d.autofocus_method || "—") + " " + Number(d.focus_before || 0).toFixed(0) + "→" + Number(d.focus_after || 0).toFixed(0);
+        el("focusroi").textContent = d.focus_roi || "—";
         el("fps").textContent = Number(d.fps).toFixed(1);
         const ts = d.timestamp ? new Date(d.timestamp * 1000).toISOString() : "—";
         el("timestamp").textContent = ts;
@@ -640,6 +657,14 @@ class LiveDebugViewer:
         manual_capture_available: bool = False,
         manual_phase: str = "idle",
         manual_message: str = "",
+        removal_detected: bool = False,
+        removal_count: int = 0,
+        autofocus_running: bool = False,
+        autofocus_method: str = "",
+        autofocus_attempt: int = 0,
+        focus_before: float = 0.0,
+        focus_after: float = 0.0,
+        focus_roi: str = "",
     ) -> None:
         """Store the latest preview copy and metadata. Never blocks on HTTP clients."""
         with self._meta_lock:
@@ -680,6 +705,14 @@ class LiveDebugViewer:
                 manual_capture_available=manual_capture_available,
                 manual_phase=manual_phase,
                 manual_message=manual_message,
+                removal_detected=removal_detected,
+                removal_count=removal_count,
+                autofocus_running=autofocus_running,
+                autofocus_method=autofocus_method,
+                autofocus_attempt=autofocus_attempt,
+                focus_before=focus_before,
+                focus_after=focus_after,
+                focus_roi=focus_roi,
             )
 
     def snapshot_meta(self) -> DebugSnapshot:
@@ -723,6 +756,14 @@ class LiveDebugViewer:
             "manual_capture_available": snap.manual_capture_available,
             "manual_phase": snap.manual_phase,
             "manual_message": snap.manual_message,
+            "removal_detected": snap.removal_detected,
+            "removal_count": snap.removal_count,
+            "autofocus_running": snap.autofocus_running,
+            "autofocus_method": snap.autofocus_method,
+            "autofocus_attempt": snap.autofocus_attempt,
+            "focus_before": snap.focus_before,
+            "focus_after": snap.focus_after,
+            "focus_roi": snap.focus_roi,
         }
 
     def wait_jpeg(self, last_seq: int, timeout: float) -> tuple[int, bytes | None]:

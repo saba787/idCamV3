@@ -91,6 +91,17 @@ class DocumentDetector:
     def last_edge_density(self) -> float:
         return self._last_edge_density
 
+    def roi_rect(self, frame_shape: tuple[int, ...] | None = None) -> tuple[int, int, int, int]:
+        """Centered document ROI as (x, y, width, height) in frame pixels."""
+        if frame_shape is not None and len(frame_shape) >= 2:
+            h, w = int(frame_shape[0]), int(frame_shape[1])
+        else:
+            w, h = self._last_frame_size
+        frac = self.config.roi_center_fraction
+        rh, rw = int(h * frac), int(w * frac)
+        y0, x0 = (h - rh) // 2, (w - rw) // 2
+        return int(x0), int(y0), int(rw), int(rh)
+
     def debug_info(self) -> DocumentDetectionDebug:
         """Return last computed metrics. Does not run detection or mutate state."""
         detected = (
@@ -214,19 +225,23 @@ class DocumentDetector:
         return presence != DocumentPresence.NO_DOCUMENT
 
     def is_scene_empty(self, frame: np.ndarray) -> bool:
-        """True when scene matches baseline (document removed)."""
+        """True when a document is no longer detected versus the empty baseline.
+
+        Table texture (Sobel edges) must not block removal. Presence uses the
+        same AND of motion-vs-baseline and edge density as auto-detection.
+        A textured empty table has low motion vs baseline, so it is empty even
+        when absolute edge_density is above the detection threshold.
+        """
         motion, edge_density = self._metrics(frame)
-        empty = (
-            motion < self.config.motion_threshold * self.config.removal_motion_factor
-            and edge_density < self.config.edge_density_threshold * self.config.removal_edge_factor
-        )
+        present = motion > self.config.motion_threshold and edge_density > self.config.edge_density_threshold
+        empty = not present
         if empty:
             logger.debug(
-                "Scene empty: motion=%.2f edge=%.4f (thresholds motion<%.2f edge<%.4f)",
+                "Scene empty: motion=%.2f edge=%.4f (present requires motion>%.2f and edge>%.4f)",
                 motion,
                 edge_density,
-                self.config.motion_threshold * self.config.removal_motion_factor,
-                self.config.edge_density_threshold * self.config.removal_edge_factor,
+                self.config.motion_threshold,
+                self.config.edge_density_threshold,
             )
         return empty
 

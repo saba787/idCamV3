@@ -100,13 +100,17 @@ class ApplicationOrchestrator:
         self._command_event = threading.Event()
         self._manual_phase = "idle"
         self._manual_message = ""
+        self._resume_state = AppState.IDLE
+        self._awaiting_clear_scene = False
+        self._clear_scene_count = 0
+        self._last_scene_empty = False
         if config.debug.enabled:
             self._debug_viewer = LiveDebugViewer(config.debug)
             self._debug_viewer.set_capture_handler(self.request_manual_capture)
 
     @property
     def has_active_transaction(self) -> bool:
-        """True when the state machine is in any transactional state."""
+        """True while autofocus/capture/upload is running. Not WAITING_FOR_REMOVAL."""
         return self.sm.in_transaction()
 
     async def run(self) -> int:
@@ -322,10 +326,24 @@ class ApplicationOrchestrator:
         if self._take_manual_request():
             logger.info("event=pipeline_stage stage=manual_capture_start state=IDLE")
             self.stability.reset()
+            self._resume_state = AppState.IDLE
             self._begin_transaction(trigger="manual")
             self._set_manual_phase("detected", "Manual capture started")
             self._publish_debug(frame)
             self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
+            return
+        if self._awaiting_clear_scene:
+            present = self.detector.detect(frame)
+            self._last_scene_empty = not present
+            self._publish_debug(frame)
+            if not present:
+                self._clear_scene_count += 1
+            else:
+                self._clear_scene_count = 0
+            if self._clear_scene_count >= self.config.detection.removal_frames_required:
+                self._awaiting_clear_scene = False
+                self._clear_scene_count = 0
+                logger.info("event=auto_capture_armed reason=scene_cleared_after_failure")
             return
         detected = self.detector.detect(frame)
         self._publish_debug(frame)
@@ -361,6 +379,10 @@ class ApplicationOrchestrator:
     def _begin_transaction(self, *, trigger: str = "auto") -> ActiveCaptureTransaction:
         if self._transaction is not None and not self._transaction.is_terminal:
             raise RuntimeError("Cannot begin transaction: one already active")
+        if self.sm.state == AppState.WAITING_FOR_REMOVAL:
+            self._resume_state = AppState.WAITING_FOR_REMOVAL
+        else:
+            self._resume_state = AppState.IDLE
         with self._cmd_lock:
             if self._pending_command == "manual_capture":
                 self._pending_command = "manual_capture_running"
@@ -380,13 +402,21 @@ class ApplicationOrchestrator:
         """HTTP-thread entry: queue a capture through the existing state machine."""
         state = self.sm.state
         txn_active = self._transaction is not None and not self._transaction.is_terminal
-        if state != AppState.IDLE or self.has_active_transaction or txn_active:
+        allowed = {AppState.IDLE, AppState.WAITING_FOR_REMOVAL}
+        if state not in allowed or self.has_active_transaction or txn_active:
             logger.info("event=manual_capture_rejected status=busy state=%s", state.value)
             return {
                 "ok": False,
                 "status": "busy",
                 "state": state.value,
                 "message": f"Busy ({state.value})",
+            }
+        if not self.health.camera.healthy:
+            return {
+                "ok": False,
+                "status": "busy",
+                "state": state.value,
+                "message": "Camera is not healthy",
             }
         with self._cmd_lock:
             if self._pending_command is not None:
@@ -441,12 +471,13 @@ class ApplicationOrchestrator:
 
     def _manual_status(self) -> tuple[bool, str, str]:
         with self._cmd_lock:
+            txn_active = self._transaction is not None and not self._transaction.is_terminal
             available = (
-                self.sm.state == AppState.IDLE
-                and not self.has_active_transaction
-                and (self._transaction is None or self._transaction.is_terminal)
+                self.health.camera.healthy
                 and self._pending_command is None
-                and self.health.camera.healthy
+                and not self.has_active_transaction
+                and not txn_active
+                and self.sm.state in {AppState.IDLE, AppState.WAITING_FOR_REMOVAL}
             )
             return available, self._manual_phase, self._manual_message
 
@@ -662,13 +693,24 @@ class ApplicationOrchestrator:
             return
         await asyncio.sleep(2.0)
         self._removal_count = 0
-        self._transition(AppState.WAITING_FOR_REMOVAL)
+        self._last_scene_empty = False
+        self._transition(AppState.WAITING_FOR_REMOVAL, reason="capture_success")
 
     async def _removal_tick(self) -> None:
         frame = await self._safe_preview()
         if frame is None:
             return
-        if self.detector.is_scene_empty(frame):
+        if self._take_manual_request():
+            logger.info("event=pipeline_stage stage=manual_capture_start state=WAITING_FOR_REMOVAL")
+            self.stability.reset()
+            self._begin_transaction(trigger="manual")
+            self._set_manual_phase("detected", "Manual capture started")
+            self._publish_debug(frame)
+            self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
+            return
+        empty = self.detector.is_scene_empty(frame)
+        self._last_scene_empty = empty
+        if empty:
             self._removal_count += 1
         else:
             self._removal_count = 0
@@ -677,13 +719,15 @@ class ApplicationOrchestrator:
 
         if self._removal_count >= self.config.detection.removal_frames_required:
             logger.info(
-                "event=document_removed reason=scene_empty consecutive_frames=%d motion=%.2f",
+                "event=document_removed reason=scene_empty consecutive_frames=%d motion=%.2f edge_density=%.4f",
                 self._removal_count,
                 self.detector.last_motion,
+                self.detector.last_edge_density,
             )
             self._clear_transaction()
             self.detector.reset_baseline()
-            self._transition(AppState.IDLE)
+            self._awaiting_clear_scene = False
+            self._transition(AppState.IDLE, reason="document_removed")
 
     async def _recovery_tick(self) -> None:
         if self._recovery_in_progress:
@@ -784,29 +828,41 @@ class ApplicationOrchestrator:
             self._transaction.mark_failed(detail)
         self.health.record_failure(detail)
         self._cleanup_transaction_files()
+        dest = (
+            AppState.WAITING_FOR_REMOVAL
+            if self._resume_state == AppState.WAITING_FOR_REMOVAL
+            else AppState.IDLE
+        )
         self.status.update(
-            AppState.WAITING_FOR_REMOVAL,
+            dest,
             capture_id=self._transaction.capture_id if self._transaction else None,
             failure_key=failure_key,
             last_error=detail,
             **self._health_status_kwargs(),
         )
         logger.info(
-            "event=pipeline_stage stage=failed reason=%s detail=%s capture_id=%s",
+            "event=pipeline_stage stage=failed reason=%s detail=%s capture_id=%s next_state=%s",
             failure_key,
             detail,
             self._transaction.capture_id if self._transaction else None,
+            dest.value,
         )
         self._finish_manual_request(
             {
                 "ok": False,
                 "status": "failed",
-                "state": AppState.WAITING_FOR_REMOVAL.value,
+                "state": dest.value,
                 "capture_id": self._transaction.capture_id if self._transaction else None,
                 "message": f"{failure_key}: {detail}",
             }
         )
-        self._transition(AppState.WAITING_FOR_REMOVAL)
+        if dest == AppState.IDLE:
+            self._awaiting_clear_scene = True
+            self._clear_scene_count = 0
+            self._clear_transaction()
+            self._transition(AppState.IDLE, reason=f"{failure_key}")
+        else:
+            self._transition(AppState.WAITING_FOR_REMOVAL, reason=f"{failure_key}")
 
     def _cleanup_transaction_files(self) -> None:
         if self._capture_path:
@@ -856,12 +912,23 @@ class ApplicationOrchestrator:
         if target != AppState.ERROR:
             self._error_backoff_claimed = False
         set_log_context(state=target.value)
+        doc = self.detector.debug_info()
+        stab = self.stability.debug_info()
         logger.info(
-            "event=state_transition from=%s to=%s reason=%s capture_id=%s",
+            "event=state_transition from=%s to=%s reason=%s capture_id=%s "
+            "document_detected=%s motion=%.2f frame_motion=%.2f edge_density=%.4f "
+            "stable=%s removal_detected=%s removal_count=%d",
             prev.value,
             target.value,
             reason,
             self._transaction.capture_id if self._transaction else None,
+            doc.detected,
+            doc.motion,
+            doc.frame_motion,
+            doc.edge_density,
+            stab.stable,
+            self._last_scene_empty,
+            self._removal_count,
         )
         ready = target == AppState.IDLE and self.health.overall_ready
         message_state = target
@@ -889,6 +956,7 @@ class ApplicationOrchestrator:
         if not camera_healthy and error_msg is None:
             error_msg = self.health.camera.message
         available, phase, message = self._manual_status()
+        af = self.autofocus.debug
         viewer.publish(
             frame,
             state=self.sm.state.value,
@@ -915,6 +983,14 @@ class ApplicationOrchestrator:
             manual_capture_available=available,
             manual_phase=phase,
             manual_message=message,
+            removal_detected=self._last_scene_empty,
+            removal_count=self._removal_count,
+            autofocus_running=af.running,
+            autofocus_method=af.method,
+            autofocus_attempt=af.attempt,
+            focus_before=af.focus_before,
+            focus_after=af.focus_after,
+            focus_roi=af.focus_roi,
         )
 
     async def _shutdown(self) -> None:

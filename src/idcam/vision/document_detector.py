@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 import cv2
 import numpy as np
 
 from idcam.config.schema import DetectionConfig
 from idcam.logging.setup import get_logger
-from idcam.vision.document_lock import DocumentLock, find_document_candidate
+from idcam.vision.document_geometry import corner_motion, detect_document_geometry
+from idcam.vision.document_lock import DocumentLock
 from idcam.vision.motion import illumination_change, normalize_gray, structural_motion, to_gray
-from idcam.vision.sharpness import clip_roi, roi_rect
+from idcam.vision.sharpness import clip_roi, inner_roi, roi_rect
 
 logger = get_logger("vision.document_detector")
 
@@ -47,6 +49,13 @@ class DocumentDetectionDebug:
     document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
     focus_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
     lock_confidence: float = 0.0
+    geometry_confidence: float = 0.0
+    document_corners: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] = (
+        (0, 0),
+        (0, 0),
+        (0, 0),
+        (0, 0),
+    )
 
 
 def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -> float:
@@ -88,6 +97,8 @@ class DocumentDetector:
         self._last_document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._last_focus_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._lock_prev_norm: np.ndarray | None = None
+        self._last_geometry: Any = None
+        self._prev_corners: tuple[tuple[int, int], ...] | None = None
 
     @property
     def last_motion(self) -> float:
@@ -108,43 +119,79 @@ class DocumentDetector:
             w, h = self._last_frame_size
         return roi_rect((h, w), self.config.roi_center_fraction)
 
+    def _find_geometry(self, frame: np.ndarray):
+        h, w = frame.shape[:2]
+        self._last_frame_size = (int(w), int(h))
+        geom = detect_document_geometry(
+            frame,
+            min_area_fraction=self.config.geometry_min_area_fraction,
+            max_area_fraction=self.config.geometry_max_area_fraction,
+        )
+        self._last_geometry = geom
+        if geom:
+            self._last_document_roi = geom.bbox
+            self._last_focus_roi = inner_roi(
+                geom.bbox,
+                inset_fraction=self.config.focus_roi_inset_fraction,
+                frame_shape=frame.shape,
+            )
+            self._last_roi_size = (geom.bbox[2], geom.bbox[3])
+            self._last_edge_density = min(1.0, geom.edge_strength / 120.0)
+        return geom
+
     def document_preview_roi(self, frame: np.ndarray | None = None) -> tuple[int, int, int, int]:
         if self.lock.is_locked:
             return self.lock.roi
-        if frame is None:
-            return self._last_document_roi if self._last_document_roi != (0, 0, 0, 0) else self.roi_rect()
-        center = self.roi_rect(frame.shape)
-        found = find_document_candidate(frame, center)
-        if found:
-            roi, _ = found
-            self._last_document_roi = roi
-        return self._last_document_roi if self._last_document_roi != (0, 0, 0, 0) else center
+        if self._last_document_roi != (0, 0, 0, 0):
+            return self._last_document_roi
+        if frame is not None:
+            geom = self._find_geometry(frame)
+            if geom:
+                return geom.bbox
+        return self.roi_rect(frame.shape if frame is not None else None)
 
     def focus_preview_roi(self, frame: np.ndarray | None = None) -> tuple[int, int, int, int]:
         if self.lock.is_locked:
             return self.lock.focus_roi
-        if frame is not None:
-            self.document_preview_roi(frame)
         if self._last_focus_roi != (0, 0, 0, 0):
             return self._last_focus_roi
         if frame is not None:
-            from idcam.vision.sharpness import inner_roi
-
-            center = self.roi_rect(frame.shape)
-            return inner_roi(center, self.config.focus_roi_inset_fraction, frame.shape)
+            roi = self.document_preview_roi(frame)
+            return inner_roi(roi, self.config.focus_roi_inset_fraction, frame.shape)
         return self.roi_rect()
 
     def lock_document(self, frame: np.ndarray) -> bool:
-        center = self.roi_rect(frame.shape)
-        found = find_document_candidate(frame, center)
-        if found is None:
-            self.lock.lock(frame, center, 0.5)
-            roi = center
-        else:
-            roi, conf = found
-            self.lock.lock(frame, roi, conf)
+        geom = self._last_geometry or self._find_geometry(frame)
+        if geom is None:
+            logger.warning("event=document_lock_fallback reason=no_geometry")
+            h, w = frame.shape[:2]
+            margin_x, margin_y = int(w * 0.15), int(h * 0.15)
+            corners = (
+                (margin_x, margin_y),
+                (w - margin_x, margin_y),
+                (w - margin_x, h - margin_y),
+                (margin_x, h - margin_y),
+            )
+            from idcam.vision.document_geometry import DocumentGeometry, corners_to_bbox
+
+            bbox = corners_to_bbox(corners, frame.shape)
+            geom = DocumentGeometry(
+                corners=corners,
+                bbox=bbox,
+                center=(bbox[0] + bbox[2] // 2, bbox[1] + bbox[3] // 2),
+                width=bbox[2],
+                height=bbox[3],
+                rotation_deg=0.0,
+                aspect_ratio=bbox[2] / max(bbox[3], 1),
+                area_fraction=(bbox[2] * bbox[3]) / max(w * h, 1),
+                confidence=0.35,
+                edge_strength=0.0,
+                rectangularity=0.9,
+            )
+        self.lock.lock(frame, geom)
         self._last_document_roi = self.lock.roi
         self._last_focus_roi = self.lock.focus_roi
+        self._prev_corners = self.lock.corners
         self._lock_prev_norm = None
         self._detected_latched = True
         self._present_frames = self.config.detect_frames_required
@@ -206,12 +253,9 @@ class DocumentDetector:
             self._last_reject_reason = ""
 
         center = self.roi_rect(frame.shape)
-        found = find_document_candidate(frame, center)
-        if found:
-            roi, _ = found
-            self._last_document_roi = roi
-            if self.lock.is_locked:
-                self.lock.update(frame, roi)
+        found_roi = None
+        if self.lock.is_locked and self._last_geometry:
+            found_roi = self._last_geometry.bbox
 
         return motion, edge_density
 
@@ -256,6 +300,10 @@ class DocumentDetector:
         detected = self.is_latched
         roi = self.lock.roi if self.lock.is_locked else self._last_document_roi
         focus = self.lock.focus_roi if self.lock.is_locked else self._last_focus_roi
+        corners = self.lock.corners if self.lock.is_locked else (
+            self._last_geometry.corners if self._last_geometry else ((0, 0), (0, 0), (0, 0), (0, 0))
+        )
+        geom_conf = self._last_geometry.confidence if self._last_geometry else 0.0
         return DocumentDetectionDebug(
             motion=self._last_motion,
             edge_density=self._last_edge_density,
@@ -277,6 +325,8 @@ class DocumentDetector:
             document_roi=roi,
             focus_roi=focus,
             lock_confidence=self.lock.state.confidence,
+            geometry_confidence=geom_conf,
+            document_corners=corners,
         )
 
     def reset_baseline(self) -> None:
@@ -328,32 +378,63 @@ class DocumentDetector:
         return DocumentPresence.DOCUMENT_STABLE
 
     def detect(self, frame: np.ndarray) -> bool:
-        motion, edge_density = self._metrics(frame)
-        return self._update_latch(motion, edge_density)
+        gray = to_gray(frame)
+        self._last_gray_std = float(np.std(gray))
+        self._last_gray_mean = float(np.mean(gray))
+
+        geom = self._find_geometry(frame)
+        if self.lock.is_locked:
+            if geom and geom.confidence >= self.config.min_geometry_confidence * 0.65:
+                self.lock.update(frame, geom)
+                self._prev_corners = self.lock.corners
+            return True
+
+        if geom and geom.confidence >= self.config.min_geometry_confidence:
+            self._present_frames += 1
+            self._absent_frames = 0
+            self._last_reject_reason = ""
+            if not self._detected_latched and self._present_frames >= self.config.detect_frames_required:
+                self._detected_latched = True
+        else:
+            self._present_frames = 0
+            if self._detected_latched:
+                self._absent_frames += 1
+                if self._absent_frames >= self.config.lose_frames_required:
+                    self._detected_latched = False
+            else:
+                self._absent_frames += 1
+            if geom is None:
+                self._last_reject_reason = "no_document_geometry"
+            else:
+                self._last_reject_reason = f"low_geometry_confidence_{geom.confidence:.2f}"
+
+        return self._detected_latched or self.lock.is_locked
 
     def is_scene_empty(self, frame: np.ndarray) -> bool:
-        if self.lock.is_locked:
+        geom = self._find_geometry(frame)
+        if geom and geom.confidence >= self.config.min_geometry_confidence * 0.55:
+            return False
+        if self.lock.is_locked and self._baseline_norm is not None:
             gray = self._patch_gray(frame, self.lock.roi)
             norm = normalize_gray(gray)
-            self._last_edge_density = gradient_edge_density(gray)
-            if self._baseline_norm is not None and self._baseline_norm.shape == norm.shape:
+            if self._baseline_norm.shape == norm.shape:
                 motion = structural_motion(self._baseline_norm, norm)
                 return motion < self.config.motion_threshold * self.config.lose_motion_factor
-            return False
-
-        gray = self._roi_gray(frame)
-        norm = normalize_gray(gray)
-        self._last_edge_density = gradient_edge_density(gray)
-        if self._baseline_norm is not None and self._baseline_norm.shape == norm.shape:
-            motion = structural_motion(self._baseline_norm, norm)
-            if motion < self.config.motion_threshold * self.config.lose_motion_factor:
-                return True
-        motion, edge_density = self._metrics(frame)
-        return self._clearly_absent(motion, edge_density)
+        return geom is None or geom.confidence < self.config.min_geometry_confidence * 0.35
 
     def structural_motion_in_lock(self, frame: np.ndarray) -> float:
         if not self.lock.is_locked:
             return self._last_frame_motion
+        geom = detect_document_geometry(
+            frame,
+            min_area_fraction=self.config.geometry_min_area_fraction,
+            max_area_fraction=self.config.geometry_max_area_fraction,
+        )
+        if geom and self._prev_corners is not None:
+            motion = corner_motion(self._prev_corners, geom.corners)
+            self._prev_corners = geom.corners
+            self._last_frame_motion = motion
+            return motion
         gray = self._patch_gray(frame, self.lock.roi)
         norm = normalize_gray(gray)
         if self._lock_prev_norm is None or self._lock_prev_norm.shape != norm.shape:
@@ -361,4 +442,5 @@ class DocumentDetector:
             return 0.0
         motion = structural_motion(self._lock_prev_norm, norm)
         self._lock_prev_norm = norm.copy()
+        self._last_frame_motion = motion
         return motion

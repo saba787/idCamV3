@@ -109,6 +109,10 @@ class ApplicationOrchestrator:
         self._upload_started = False
         self._upload_result = ""
         self._manual_capture_requested = False
+        self._last_preview_size = (
+            int(config.camera.preview_width),
+            int(config.camera.preview_height),
+        )
         if config.debug.enabled:
             self._debug_viewer = LiveDebugViewer(config.debug)
             self._debug_viewer.set_capture_handler(self.request_manual_capture)
@@ -296,6 +300,11 @@ class ApplicationOrchestrator:
                 await handler()
         finally:
             self._state_tick_running = False
+
+    def _note_preview_frame(self, frame) -> None:
+        if frame is not None and getattr(frame, "ndim", 0) >= 2:
+            h, w = int(frame.shape[0]), int(frame.shape[1])
+            self._last_preview_size = (w, h)
 
     async def _safe_preview(self):
         try:
@@ -626,7 +635,15 @@ class ApplicationOrchestrator:
         self._set_manual_phase("validating", "Validating image...")
         logger.info("event=pipeline_stage stage=image_validation path=%s", self._capture_path)
         try:
-            result = self.validator.validate(self._capture_path)
+            focus_roi = self.detector.focus_preview_roi()
+            preview_size = self._last_preview_size
+            scaler_crop = self.camera.current_scaler_crop()
+            result = self.validator.validate(
+                self._capture_path,
+                document_roi=focus_roi,
+                preview_size=preview_size,
+                scaler_crop=scaler_crop,
+            )
             self._transaction.mark_validated(
                 size=result.file_bytes,
                 width=result.width,
@@ -635,9 +652,11 @@ class ApplicationOrchestrator:
                 sharpness=result.sharpness,
             )
             logger.info(
-                "event=image_validated sha256=%s sharpness=%.1f",
+                "event=image_validated sha256=%s sharpness=%.1f doc_sharpness=%.1f bytes=%d",
                 result.sha256[:16],
                 result.sharpness,
+                result.document_sharpness,
+                result.file_bytes,
             )
             self.sm.touch_progress()
             self._transition(AppState.UPLOADING)
@@ -656,9 +675,11 @@ class ApplicationOrchestrator:
         self._upload_result = "started"
         self._set_manual_phase("uploading", "Uploading...")
         logger.info(
-            "event=pipeline_stage stage=uploading capture_id=%s path=%s",
+            "event=pipeline_stage stage=uploading capture_id=%s path=%s bytes=%s sha256=%s",
             self._transaction.capture_id,
             self._capture_path,
+            self._transaction.image_size,
+            (self._transaction.image_sha256 or "")[:16],
         )
         request = UploadRequest(
             capture_id=self._transaction.capture_id,
@@ -1003,6 +1024,7 @@ class ApplicationOrchestrator:
         viewer = self._debug_viewer
         if viewer is None:
             return
+        self._note_preview_frame(frame)
         doc = self.detector.debug_info()
         stab = self.stability.debug_info()
         camera_healthy = self.health.camera.healthy and not camera_error

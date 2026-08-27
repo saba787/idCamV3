@@ -103,6 +103,46 @@ def accept_preview_focus(
     return False
 
 
+def scale_preview_roi_to_image(
+    roi: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+    image_size: tuple[int, int],
+    scaler_crop: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    """Map preview ROI to full-resolution still coordinates via ScalerCrop."""
+    from idcam.camera.manager import map_preview_roi_to_sensor
+
+    pw, ph = int(preview_size[0]), int(preview_size[1])
+    iw, ih = int(image_size[0]), int(image_size[1])
+    if scaler_crop is not None:
+        sx, sy, sw, sh = (int(v) for v in scaler_crop)
+        mapped = map_preview_roi_to_sensor(roi, (pw, ph), scaler_crop)
+        return clip_roi(mapped, (ih, iw))
+    sx = int(round(roi[0] * iw / max(pw, 1)))
+    sy = int(round(roi[1] * ih / max(ph, 1)))
+    sw = max(1, int(round(roi[2] * iw / max(pw, 1))))
+    sh = max(1, int(round(roi[3] * ih / max(ph, 1))))
+    return clip_roi((sx, sy, sw, sh), (ih, iw))
+
+
+def still_sharpness(
+    frame: np.ndarray,
+    roi: tuple[int, int, int, int] | None = None,
+) -> float:
+    """Laplacian variance on full-resolution still (BGR or RGB)."""
+    return laplacian_variance(frame, roi=roi)
+
+
+def combined_preview_sharpness(
+    frame: np.ndarray,
+    roi: tuple[int, int, int, int] | None = None,
+) -> tuple[float, float]:
+    """Return Tenengrad and Laplacian on preview document ROI."""
+    ten = preview_sharpness(frame, roi=roi)
+    lap = laplacian_variance(frame, roi=roi)
+    return ten, lap
+
+
 def mean_brightness(frame: np.ndarray) -> float:
     if frame.ndim == 3:
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)

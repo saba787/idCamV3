@@ -94,6 +94,9 @@ class DetectionConfig(BaseModel):
     roi_smooth_alpha: float = Field(0.25, gt=0.05, le=1.0)
     removal_motion_factor: float = Field(0.5, gt=0, le=1.0)
     removal_edge_factor: float = Field(0.5, gt=0, le=2.0)
+    min_geometry_confidence: float = Field(0.42, gt=0, le=1.0)
+    geometry_min_area_fraction: float = Field(0.05, gt=0, le=1.0)
+    geometry_max_area_fraction: float = Field(0.85, gt=0, le=1.0)
     baseline_alpha: float = Field(0.05, gt=0, le=1.0)
 
 
@@ -102,6 +105,7 @@ class QualityConfig(BaseModel):
     preview_focus_min_ratio: float = Field(1.15, gt=1.0, le=3.0)
     preview_focus_min_delta: float = Field(1.5, gt=0)
     min_sharpness: float = Field(80.0, gt=0)
+    min_document_sharpness: float = Field(40.0, gt=0)
     min_file_bytes: int = Field(100_000, gt=0)
     max_file_bytes: int = Field(50_000_000, gt=0)
     min_brightness: float = Field(30.0, ge=0, le=255)

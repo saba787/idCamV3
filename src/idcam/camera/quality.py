@@ -13,7 +13,7 @@ from PIL import Image
 from idcam.config.schema import CameraConfig, QualityConfig
 from idcam.exceptions import ImageValidationError
 from idcam.logging.setup import get_logger
-from idcam.vision.sharpness import laplacian_variance, mean_brightness
+from idcam.vision.sharpness import laplacian_variance, mean_brightness, scale_preview_roi_to_image, still_sharpness
 
 logger = get_logger("camera.quality")
 
@@ -24,8 +24,10 @@ class ValidationResult:
     height: int
     file_bytes: int
     sharpness: float
+    document_sharpness: float
     brightness: float
     sha256: str
+    document_roi: tuple[int, int, int, int] | None = None
 
 
 class ImageValidator:
@@ -35,7 +37,14 @@ class ImageValidator:
         self.config = quality_config
         self.camera_config = camera_config
 
-    def validate(self, path: Path) -> ValidationResult:
+    def validate(
+        self,
+        path: Path,
+        *,
+        document_roi: tuple[int, int, int, int] | None = None,
+        preview_size: tuple[int, int] | None = None,
+        scaler_crop: tuple[int, int, int, int] | None = None,
+    ) -> ValidationResult:
         if not path.exists():
             raise ImageValidationError(f"Image file not found: {path}")
         if not path.is_file():
@@ -84,15 +93,36 @@ class ImageValidator:
         sharpness = laplacian_variance(frame)
         brightness = mean_brightness(frame)
 
+        still_doc_roi: tuple[int, int, int, int] | None = None
+        document_sharpness = sharpness
+        if document_roi is not None and preview_size is not None:
+            still_doc_roi = scale_preview_roi_to_image(
+                document_roi,
+                preview_size,
+                (width, height),
+                scaler_crop=scaler_crop,
+            )
+            document_sharpness = still_sharpness(frame, roi=still_doc_roi)
+
         logger.info(
-            "Sharpness check: score=%.1f min_required=%.1f",
+            "event=pipeline_stage stage=image_validated "
+            "sharpness_global=%.1f sharpness_document=%.1f min_global=%.1f min_document=%.1f "
+            "document_roi=%s",
             sharpness,
+            document_sharpness,
             self.config.min_sharpness,
+            self.config.min_document_sharpness,
+            still_doc_roi,
         )
 
         if sharpness < self.config.min_sharpness:
             raise ImageValidationError(
-                f"Image too blurry: sharpness={sharpness:.1f} min={self.config.min_sharpness:.1f}"
+                f"Image too blurry (global): sharpness={sharpness:.1f} min={self.config.min_sharpness:.1f}"
+            )
+        if document_roi is not None and document_sharpness < self.config.min_document_sharpness:
+            raise ImageValidationError(
+                f"Document region too blurry: sharpness={document_sharpness:.1f} "
+                f"min={self.config.min_document_sharpness:.1f} roi={still_doc_roi}"
             )
         if brightness < self.config.min_brightness:
             raise ImageValidationError(f"Image too dark: brightness={brightness:.1f}")
@@ -107,16 +137,20 @@ class ImageValidator:
             height=height,
             file_bytes=file_bytes,
             sharpness=sharpness,
+            document_sharpness=document_sharpness,
             brightness=brightness,
             sha256=sha256,
+            document_roi=still_doc_roi,
         )
         logger.info(
-            "Image validated: %dx%d, %d bytes, sharpness=%.1f, sha256=%s",
+            "Image validated: %dx%d bytes=%d sharpness=%.1f doc_sharpness=%.1f sha256=%s path=%s",
             width,
             height,
             file_bytes,
             sharpness,
+            document_sharpness,
             sha256[:16],
+            path,
         )
         return result
 

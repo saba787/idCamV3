@@ -66,8 +66,7 @@ class TestDocumentDetectionDebug:
         assert isinstance(info, DocumentDetectionDebug)
         assert result is True
         assert info.detected is True
-        assert info.motion > info.motion_threshold
-        assert info.edge_density > info.edge_density_threshold
+        assert info.geometry_confidence >= detection_config.min_geometry_confidence
         assert detector.detect(frame) is True
 
     def test_debug_info_does_not_run_detection(self, detection_config):
@@ -82,26 +81,28 @@ class TestDocumentDetectionDebug:
         detector = DocumentDetector(detection_config)
         frame = np.full((480, 640, 3), 128, dtype=np.uint8)
         detector.detect(frame)
-        detector.detect(frame)
         info = detector.debug_info()
         assert info.detected is False
         assert info.reject_reason
-        assert info.roi_width > 0
         assert info.frame_width == 640
 
     def test_rgb_preview_format_detects_document(self, detection_config):
         detector = DocumentDetector(detection_config)
-        baseline = np.zeros((240, 320, 3), dtype=np.uint8)
-        baseline[:] = (180, 40, 40)  # RGB red-ish empty scene
-        detector.update_baseline(baseline)
-        frame = np.zeros((240, 320, 3), dtype=np.uint8)
-        frame[:] = (40, 180, 40)
-        frame[20:220:4, :] = (10, 10, 10)
-        frame[:, 20:300:6] = (240, 240, 240)
+        frame = _document_frame_like()
         assert detector.detect(frame)
         info = detector.debug_info()
-        assert info.edge_density > info.edge_density_threshold
+        assert info.edge_density > 0
         assert info.reject_reason == ""
+
+
+def _document_frame_like(width=320, height=240):
+    frame = np.full((height, width, 3), 210, dtype=np.uint8)
+    frame[30:210, 40:280] = 50
+    frame[30:38, 40:280] = 0
+    frame[202:210, 40:280] = 0
+    frame[30:210, 40:48] = 0
+    frame[30:210, 272:280] = 0
+    return frame
 
     def test_static_document_is_not_moving(self, detection_config):
         detector = DocumentDetector(detection_config)

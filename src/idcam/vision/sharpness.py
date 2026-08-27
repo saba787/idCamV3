@@ -25,6 +25,22 @@ def clip_roi(roi: tuple[int, int, int, int], frame_shape: tuple[int, ...]) -> tu
     return x, y, rw, rh
 
 
+def inner_roi(
+    roi: tuple[int, int, int, int],
+    inset_fraction: float = 0.12,
+    frame_shape: tuple[int, ...] | None = None,
+) -> tuple[int, int, int, int]:
+    """Inset document bbox to avoid borders/background in focus measurement."""
+    x, y, rw, rh = (int(v) for v in roi)
+    inset_fraction = min(max(float(inset_fraction), 0.0), 0.4)
+    dx = max(1, int(rw * inset_fraction))
+    dy = max(1, int(rh * inset_fraction))
+    inner = (x + dx, y + dy, max(1, rw - 2 * dx), max(1, rh - 2 * dy))
+    if frame_shape is not None:
+        return clip_roi(inner, frame_shape)
+    return inner
+
+
 def laplacian_variance(
     frame: np.ndarray,
     roi_fraction: float = 0.7,

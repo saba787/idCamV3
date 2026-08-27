@@ -10,7 +10,7 @@ import numpy as np
 
 from idcam.config.schema import DetectionConfig
 from idcam.logging.setup import get_logger
-from idcam.vision.sharpness import clip_roi
+from idcam.vision.sharpness import clip_roi, inner_roi
 
 logger = get_logger("vision.document_detector")
 
@@ -43,15 +43,11 @@ class DocumentDetectionDebug:
     gray_mean: float = 0.0
     frame_motion: float = 0.0
     document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
+    focus_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -> float:
-    """Fraction of ROI pixels with Sobel magnitude above ``magnitude_threshold``.
-
-    Canny(50, 150) misses printed texture on a mildly defocused 1080p preview.
-    Sobel magnitude still measures document structure without lowering the
-    configured edge_density_threshold.
-    """
+    """Fraction of ROI pixels with Sobel magnitude above ``magnitude_threshold``."""
     if gray.size == 0:
         return 0.0
     work = np.ascontiguousarray(gray)
@@ -67,14 +63,17 @@ class DocumentDetector:
     """
     Detects document presence using frame differencing and edge density in ROI.
 
-    Distinguishes: no document, entering, moving, stable, ready.
+    Uses temporal hysteresis: separate enter/lose thresholds and consecutive-frame
+    counters so exposure noise does not flap detection state.
     """
 
     def __init__(self, config: DetectionConfig) -> None:
         self.config = config
         self._baseline: np.ndarray | None = None
         self._roi_slice: tuple[slice, slice] | None = None
-        self._presence_frames = 0
+        self._present_frames = 0
+        self._absent_frames = 0
+        self._detected_latched = False
         self._last_motion = 0.0
         self._last_edge_density = 0.0
         self._last_reject_reason = "no_frame"
@@ -85,6 +84,7 @@ class DocumentDetector:
         self._prev_gray: np.ndarray | None = None
         self._last_frame_motion = 0.0
         self._last_document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._last_focus_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
 
     @property
     def last_motion(self) -> float:
@@ -94,8 +94,12 @@ class DocumentDetector:
     def last_edge_density(self) -> float:
         return self._last_edge_density
 
+    @property
+    def is_latched(self) -> bool:
+        return self._detected_latched
+
     def roi_rect(self, frame_shape: tuple[int, ...] | None = None) -> tuple[int, int, int, int]:
-        """Centered document ROI as (x, y, width, height) in frame pixels."""
+        """Centered detection ROI as (x, y, width, height) in frame pixels."""
         if frame_shape is not None and len(frame_shape) >= 2:
             h, w = int(frame_shape[0]), int(frame_shape[1])
         else:
@@ -106,11 +110,7 @@ class DocumentDetector:
         return int(x0), int(y0), int(rw), int(rh)
 
     def document_preview_roi(self, frame: np.ndarray | None = None) -> tuple[int, int, int, int]:
-        """Document bounding box in preview pixels, else the centered detection ROI.
-
-        Coordinates are (x, y, width, height) in the current preview frame,
-        matching laplacian_variance / AfWindows mapping — not sensor pixels.
-        """
+        """Document bounding box in preview pixels (x, y, width, height)."""
         if frame is None:
             if self._last_document_roi != (0, 0, 0, 0):
                 return self._last_document_roi
@@ -118,7 +118,27 @@ class DocumentDetector:
         center = self.roi_rect(frame.shape)
         tight = self._tight_document_box(frame, center)
         self._last_document_roi = clip_roi(tight, frame.shape)
+        self._last_focus_roi = inner_roi(
+            self._last_document_roi,
+            inset_fraction=self.config.focus_roi_inset_fraction,
+            frame_shape=frame.shape,
+        )
         return self._last_document_roi
+
+    def focus_preview_roi(self, frame: np.ndarray | None = None) -> tuple[int, int, int, int]:
+        """Inner document ROI for autofocus/sharpness — preview pixels."""
+        if frame is not None:
+            self.document_preview_roi(frame)
+        if self._last_focus_roi != (0, 0, 0, 0):
+            return self._last_focus_roi
+        if frame is not None:
+            center = self.roi_rect(frame.shape)
+            return inner_roi(
+                center,
+                inset_fraction=self.config.focus_roi_inset_fraction,
+                frame_shape=frame.shape,
+            )
+        return self.roi_rect()
 
     def _tight_document_box(
         self,
@@ -150,18 +170,63 @@ class DocumentDetector:
             bh + 2 * pad_y,
         )
 
-    def debug_info(self) -> DocumentDetectionDebug:
-        """Return last computed metrics. Does not run detection or mutate state."""
-        detected = (
-            self._last_motion > self.config.motion_threshold
-            and self._last_edge_density > self.config.edge_density_threshold
+    def _strong_present(self, motion: float, edge_density: float) -> bool:
+        return (
+            motion > self.config.motion_threshold
+            and edge_density > self.config.edge_density_threshold
         )
+
+    def _clearly_absent(self, motion: float, edge_density: float) -> bool:
+        return (
+            motion < self.config.motion_threshold * self.config.lose_motion_factor
+            and edge_density < self.config.edge_density_threshold * self.config.lose_edge_factor
+        )
+
+    def _update_latch(self, motion: float, edge_density: float) -> bool:
+        """Update hysteresis latch. Returns current latched presence."""
+        strong = self._strong_present(motion, edge_density)
+        if strong:
+            self._present_frames += 1
+            self._absent_frames = 0
+        else:
+            self._present_frames = 0
+            if self._detected_latched:
+                if self._clearly_absent(motion, edge_density):
+                    self._absent_frames += 1
+                # Small AE noise: hold latch, do not increment absent.
+            else:
+                self._absent_frames += 1
+
+        if not self._detected_latched and self._present_frames >= self.config.detect_frames_required:
+            self._detected_latched = True
+            self._absent_frames = 0
+            logger.debug(
+                "event=document_latch_on frames=%d motion=%.2f edge=%.4f",
+                self._present_frames,
+                motion,
+                edge_density,
+            )
+
+        if self._detected_latched and self._absent_frames >= self.config.lose_frames_required:
+            self._detected_latched = False
+            self._present_frames = 0
+            logger.debug(
+                "event=document_latch_off frames=%d motion=%.2f edge=%.4f",
+                self._absent_frames,
+                motion,
+                edge_density,
+            )
+
+        return self._detected_latched
+
+    def debug_info(self) -> DocumentDetectionDebug:
+        detected = self._detected_latched
         return DocumentDetectionDebug(
             motion=self._last_motion,
             edge_density=self._last_edge_density,
             motion_threshold=self.config.motion_threshold,
             edge_density_threshold=self.config.edge_density_threshold,
-            presence_frames=self._presence_frames,
+            presence_frames=self._present_frames,
             stable_frames_required=self.config.stable_frames_required,
             detected=detected,
             reject_reason="" if detected else self._last_reject_reason,
@@ -173,18 +238,21 @@ class DocumentDetector:
             gray_mean=self._last_gray_mean,
             frame_motion=self._last_frame_motion,
             document_roi=self._last_document_roi,
+            focus_roi=self._last_focus_roi,
         )
 
     def reset_baseline(self) -> None:
         self._baseline = None
-        self._presence_frames = 0
+        self._present_frames = 0
+        self._absent_frames = 0
+        self._detected_latched = False
         self._prev_gray = None
         self._last_frame_motion = 0.0
         self._last_document_roi = (0, 0, 0, 0)
+        self._last_focus_roi = (0, 0, 0, 0)
         self._last_reject_reason = "no_frame"
 
     def update_baseline(self, frame: np.ndarray) -> None:
-        """Update baseline from a stable empty scene."""
         gray = self._to_gray(self._get_roi(frame))
         if self._baseline is None:
             self._baseline = gray.astype(np.float32)
@@ -229,73 +297,55 @@ class DocumentDetector:
         diff = cv2.absdiff(gray, self._baseline.astype(np.uint8))
         motion = float(np.mean(diff))
         self._last_motion = motion
-        if motion <= self.config.motion_threshold and edge_density <= self.config.edge_density_threshold:
-            self._last_reject_reason = "below_motion_and_edge"
-        elif motion <= self.config.motion_threshold:
-            self._last_reject_reason = "below_motion_threshold"
-        elif edge_density <= self.config.edge_density_threshold:
-            self._last_reject_reason = "below_edge_density_threshold"
+        if not self._strong_present(motion, edge_density):
+            if motion <= self.config.motion_threshold and edge_density <= self.config.edge_density_threshold:
+                self._last_reject_reason = "below_motion_and_edge"
+            elif motion <= self.config.motion_threshold:
+                self._last_reject_reason = "below_motion_threshold"
+            elif edge_density <= self.config.edge_density_threshold:
+                self._last_reject_reason = "below_edge_density_threshold"
         else:
             self._last_reject_reason = ""
         return motion, edge_density
 
     def classify(self, frame: np.ndarray) -> DocumentPresence:
         motion, edge_density = self._metrics(frame)
-        present = motion > self.config.motion_threshold and edge_density > self.config.edge_density_threshold
+        present = self._update_latch(motion, edge_density)
 
         if not present:
-            self._presence_frames = 0
-            if motion < self.config.motion_threshold * 0.5:
+            if motion < self.config.motion_threshold * self.config.lose_motion_factor:
                 gray = self._to_gray(self._get_roi(frame))
                 alpha = self.config.baseline_alpha
                 cv2.accumulateWeighted(gray, self._baseline, alpha)
             return DocumentPresence.NO_DOCUMENT
 
-        self._presence_frames += 1
         self.document_preview_roi(frame)
-        if self._presence_frames < 2:
+        if self._present_frames < self.config.detect_frames_required and not self._detected_latched:
             return DocumentPresence.DOCUMENT_ENTERING
         if self._last_frame_motion > self.config.motion_threshold * 1.5:
             return DocumentPresence.DOCUMENT_MOVING
-        if self._presence_frames < self.config.stable_frames_required:
+        if self._present_frames < self.config.stable_frames_required:
             return DocumentPresence.DOCUMENT_STABLE
         return DocumentPresence.DOCUMENT_READY
 
     def detect(self, frame: np.ndarray) -> bool:
-        """Returns True when document is present and entering detection."""
-        presence = self.classify(frame)
-        return presence in {
-            DocumentPresence.DOCUMENT_ENTERING,
-            DocumentPresence.DOCUMENT_MOVING,
-            DocumentPresence.DOCUMENT_STABLE,
-            DocumentPresence.DOCUMENT_READY,
-        }
+        """True when document presence latch is on (hysteresis-confirmed)."""
+        motion, edge_density = self._metrics(frame)
+        if self._update_latch(motion, edge_density):
+            self.document_preview_roi(frame)
+            return True
+        return False
 
     def is_document_present(self, frame: np.ndarray) -> bool:
-        presence = self.classify(frame)
-        return presence != DocumentPresence.NO_DOCUMENT
+        motion, edge_density = self._metrics(frame)
+        return self._update_latch(motion, edge_density)
 
     def is_scene_empty(self, frame: np.ndarray) -> bool:
-        """True when a document is no longer detected versus the empty baseline.
-
-        Table texture (Sobel edges) must not block removal. Presence uses the
-        same AND of motion-vs-baseline and edge density as auto-detection.
-        A textured empty table has low motion vs baseline, so it is empty even
-        when absolute edge_density is above the detection threshold.
-        """
+        """True when document is clearly absent (hysteresis lose thresholds)."""
         motion, edge_density = self._metrics(frame)
-        present = motion > self.config.motion_threshold and edge_density > self.config.edge_density_threshold
-        empty = not present
-        if empty:
-            logger.debug(
-                "Scene empty: motion=%.2f edge=%.4f (present requires motion>%.2f and edge>%.4f)",
-                motion,
-                edge_density,
-                self.config.motion_threshold,
-                self.config.edge_density_threshold,
-            )
-        return empty
+        if self._detected_latched:
+            return self._clearly_absent(motion, edge_density)
+        return not self._strong_present(motion, edge_density)
 
     def is_document_removed(self, frame: np.ndarray, consecutive_frames: int) -> bool:
-        """True when document has been absent for required consecutive frames."""
         return consecutive_frames >= self.config.removal_frames_required

@@ -31,7 +31,7 @@ def app_config(tmp_path):
             min_height=64,
             require_expected_dimensions=False,
         ),
-        detection=DetectionConfig(stable_frames_required=2, removal_frames_required=2),
+        detection=DetectionConfig(stable_frames_required=2, removal_frames_required=2, detect_frames_required=1),
         camera=CameraConfig(preview_fps=30.0, af_timeout_sec=1.0, af_max_retries=1),
         ui=UIConfig(
             status_file=tmp_path / "run" / "status.json",

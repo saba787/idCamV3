@@ -254,7 +254,7 @@ class ApplicationOrchestrator:
             self._transition(AppState.WAITING_FOR_REMOVAL)
             return True
         if state == AppState.CAPTURING:
-            await self._enter_recovery("capture_timeout")
+            await self._fail_transaction_and_wait("capture_failed", "Capture timed out")
             return True
         if state == AppState.IMAGE_VALIDATION:
             await self._fail_transaction_and_wait("image_invalid", "Image validation timed out")
@@ -537,7 +537,7 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return
-        preview_roi = self.detector.document_preview_roi(frame)
+        preview_roi = self.detector.focus_preview_roi(frame)
         self._publish_debug(frame)
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
@@ -577,7 +577,7 @@ class ApplicationOrchestrator:
         assert self._transaction is not None
         min_sharp = self.config.quality.min_sharpness * 0.6
         self._transaction.focus_verify_attempts += 1
-        preview_roi = self.detector.document_preview_roi()
+        preview_roi = self.detector.focus_preview_roi()
         try:
             result = await self.autofocus.verify_focus(
                 self.camera,
@@ -615,7 +615,14 @@ class ApplicationOrchestrator:
         except CaptureError as exc:
             logger.error("event=capture_failed %s", exc)
             self.temp_store.cleanup(output_path)
-            await self._enter_recovery(str(exc))
+            msg = str(exc)
+            if any(
+                token in msg.lower()
+                for token in ("camera not started", "failed to restore preview", "camera unavailable")
+            ):
+                await self._enter_recovery(msg)
+            else:
+                await self._fail_transaction_and_wait("capture_failed", msg)
 
     async def _validation_tick(self) -> None:
         if not self._claim_state_action():
@@ -1034,7 +1041,11 @@ class ApplicationOrchestrator:
             lens_before=af.lens_before,
             lens_after=af.lens_after,
             improvement_ratio=af.improvement_ratio,
-            preview_focus_roi=af.preview_roi or af.focus_roi,
+            preview_focus_roi=(
+                "{},{},{},{}".format(*doc.focus_roi)
+                if doc.focus_roi != (0, 0, 0, 0)
+                else (af.preview_roi or af.focus_roi)
+            ),
             sensor_focus_roi=af.sensor_roi,
             preview_roi_wh=af.preview_roi_wh,
             document_roi="{},{},{},{}".format(*doc.document_roi) if doc.document_roi != (0, 0, 0, 0) else "",

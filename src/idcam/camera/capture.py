@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from idcam.config.schema import CameraConfig
-from idcam.exceptions import CaptureError
+from idcam.exceptions import CameraError, CaptureError
 from idcam.logging.setup import get_logger
 from idcam.storage.temp_files import TempFileStore
 
@@ -35,6 +35,9 @@ class CaptureService:
                 asyncio.to_thread(camera.capture_still_to_file, partial_path),
                 timeout=self.config.capture_timeout_sec,
             )
+        except CameraError:
+            self.temp_store.cleanup(partial_path)
+            raise
         except asyncio.TimeoutError as exc:
             self.temp_store.cleanup(partial_path)
             raise CaptureError(f"Capture timed out after {self.config.capture_timeout_sec}s") from exc

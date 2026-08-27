@@ -34,6 +34,7 @@ def app_config(tmp_path):
             edge_density_threshold=0.01,
             stable_frames_required=2,
             removal_frames_required=2,
+            detect_frames_required=1,
         ),
         camera=CameraConfig(preview_fps=30.0, af_timeout_sec=1.0, af_max_retries=1),
         ui=UIConfig(

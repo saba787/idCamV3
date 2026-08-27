@@ -203,11 +203,15 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     h, w = debug_frame.shape[:2]
     rh, rw = int(h * frac), int(w * frac)
     y0, x0 = (h - rh) // 2, (w - rw) // 2
-    cv2.rectangle(debug_frame, (x0, y0), (x0 + rw, y0 + rh), (0, 220, 80), 2)
-    doc_roi = _parse_roi(snapshot.document_roi or snapshot.preview_focus_roi or snapshot.focus_roi)
+    cv2.rectangle(debug_frame, (x0, y0), (x0 + rw, y0 + rh), (0, 180, 60), 1)
+    doc_roi = _parse_roi(snapshot.document_roi)
     if doc_roi is not None:
         dx, dy, dw, dh = doc_roi
         cv2.rectangle(debug_frame, (dx, dy), (dx + dw, dy + dh), (80, 180, 255), 2)
+    focus_roi = _parse_roi(snapshot.preview_focus_roi or snapshot.focus_roi)
+    if focus_roi is not None and focus_roi != doc_roi:
+        fx, fy, fw, fh = focus_roi
+        cv2.rectangle(debug_frame, (fx, fy), (fx + fw, fy + fh), (0, 220, 255), 2)
 
     camera = "OK" if snapshot.camera_healthy else "ERROR"
     if not snapshot.camera_healthy and snapshot.waiting_for_camera and not snapshot.camera_error:
@@ -222,25 +226,17 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     lines = [
         f"STATE: {snapshot.state}",
         f"DOCUMENT: {document}",
-        f"MOTION: {snapshot.motion:.2f}",
-        f"MOTION THRESHOLD: {snapshot.motion_threshold:.2f}",
-        f"EDGE: {snapshot.edge_density:.4f}",
-        f"EDGE THRESHOLD: {snapshot.edge_density_threshold:.4f}",
-        f"REJECT: {snapshot.reject_reason or '-'}",
-        f"ROI: {snapshot.roi_width}x{snapshot.roi_height}",
-        f"FRAME: {snapshot.frame_width}x{snapshot.frame_height}",
-        f"FRAME MOTION: {snapshot.frame_motion:.2f}",
-        f"STABLE: {snapshot.stable_count}/{snapshot.stable_required} motion={snapshot.stability_motion:.2f}/{snapshot.stability_threshold:.2f}",
+        f"MOTION: {snapshot.motion:.2f}  EDGE: {snapshot.edge_density:.4f}",
+        f"STABLE: {snapshot.stable_count}/{snapshot.stable_required} "
+        f"motion={snapshot.stability_motion:.2f}/{snapshot.stability_threshold:.2f}",
+        f"AF: {snapshot.autofocus_method or '-'} "
+        f"{snapshot.focus_before:.1f}->{snapshot.focus_after:.1f} x{snapshot.improvement_ratio:.2f}",
+        f"DOC ROI: {snapshot.document_roi or '-'}",
+        f"FOCUS ROI: {snapshot.preview_focus_roi or snapshot.focus_roi or '-'}",
         f"REMOVAL: {snapshot.removal_count} empty={snapshot.removal_detected}",
-        f"AF: {snapshot.autofocus_method or '-'} att={snapshot.autofocus_attempt}",
-        f"FOCUS: {snapshot.focus_before:.1f}->{snapshot.focus_after:.1f} x{snapshot.improvement_ratio:.2f}",
-        f"LENS: {snapshot.lens_before}->{snapshot.lens_after}",
-        f"PREVIEW ROI: {snapshot.preview_focus_roi or snapshot.focus_roi or '-'}",
-        f"SENSOR ROI: {snapshot.sensor_focus_roi or '-'}",
+        f"PIPELINE: cap={snapshot.capture_started} up={snapshot.upload_started} {snapshot.upload_result or '-'}",
         f"REASON: {snapshot.state_reason or '-'}",
-        f"MANUAL: req={snapshot.manual_capture_requested} cap={snapshot.capture_started} up={snapshot.upload_started} {snapshot.upload_result or '-'}",
-        f"FPS: {fps:.1f}",
-        f"CAMERA: {camera}",
+        f"FPS: {fps:.1f}  CAMERA: {camera}",
     ]
     if snapshot.camera_error and not snapshot.camera_healthy:
         err = snapshot.camera_error.replace("\n", " ")[:60]

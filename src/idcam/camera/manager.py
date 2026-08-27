@@ -258,7 +258,7 @@ class CameraManager:
                         self._picam2.capture_metadata()
                     except Exception:
                         logger.debug("event=still_pre_capture_metadata_failed", exc_info=True)
-                self._picam2.capture_file(str(path))
+                self._picam2.capture_file(str(path), format="jpeg")
             finally:
                 try:
                     self._picam2.stop()

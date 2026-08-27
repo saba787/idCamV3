@@ -17,6 +17,8 @@ def detection_config():
         edge_density_threshold=0.01,
         stable_frames_required=3,
         removal_frames_required=3,
+        detect_frames_required=1,
+        lose_frames_required=2,
     )
 
 
@@ -192,8 +194,52 @@ class TestStabilityDetector:
         assert sd.update(noisy) is True
         assert sd.stable_count >= detection_config.stable_frames_required
 
+class TestDetectionHysteresis:
+    def test_requires_consecutive_frames_to_detect(self):
+        cfg = DetectionConfig(
+            motion_threshold=5.0,
+            edge_density_threshold=0.01,
+            detect_frames_required=3,
+            lose_frames_required=3,
+        )
+        detector = DocumentDetector(cfg)
+        baseline = np.full((480, 640, 3), 200, dtype=np.uint8)
+        detector.update_baseline(baseline)
+        frame = baseline.copy()
+        frame[100:380, 100:540] = 50
+        frame[100:120, 100:540] = 0
+        frame[360:380, 100:540] = 0
+        frame[100:380, 100:120] = 0
+        frame[100:380, 520:540] = 0
+        assert not detector.detect(frame)
+        assert not detector.detect(frame)
+        assert detector.detect(frame)
+        assert detector.is_latched
 
-class TestDocumentPreviewRoi:
+    def test_holds_detection_through_noise(self):
+        cfg = DetectionConfig(
+            motion_threshold=5.0,
+            edge_density_threshold=0.01,
+            detect_frames_required=2,
+            lose_frames_required=5,
+            lose_motion_factor=0.4,
+            lose_edge_factor=0.4,
+        )
+        detector = DocumentDetector(cfg)
+        baseline = np.full((240, 320, 3), 200, dtype=np.uint8)
+        detector.update_baseline(baseline)
+        doc = baseline.copy()
+        doc[40:200, 40:280] = 50
+        doc[40:50, 40:280] = 0
+        for _ in range(3):
+            detector.detect(doc)
+        assert detector.is_latched
+        noisy = doc.copy()
+        noisy[100:110, 100:110] = 195
+        assert detector.detect(noisy)
+        assert detector.is_latched
+
+
     def test_roi_is_preview_pixels_inside_frame(self, detection_config):
         detector = DocumentDetector(detection_config)
         empty = np.full((1080, 1920, 3), 200, dtype=np.uint8)

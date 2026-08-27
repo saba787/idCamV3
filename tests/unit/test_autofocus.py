@@ -82,15 +82,15 @@ class FakeCamera:
 
 class TestAutofocusController:
     @pytest.mark.asyncio
-    async def test_sharp_preview_still_runs_hardware_cycle(self):
-        """Do not skip AF because the full/ROI preview already looks sharp."""
+    async def test_sharp_preview_skips_hardware_af(self):
+        """Do not move the lens when preview is already acceptably sharp."""
         camera = FakeCamera()
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
         ctl.probe_capabilities(camera)
         result = await ctl.run_autofocus(camera, sharpness_threshold=1.0)
         assert result.success is True
-        assert camera.cycle_calls == 1
-        assert result.method == "hardware_cycle"
+        assert camera.cycle_calls == 0
+        assert result.method == "already_sharp"
         assert result.roi[2] > 0
 
     @pytest.mark.asyncio
@@ -237,10 +237,10 @@ class TestPreviewFocusAcceptance:
         camera = FakeCamera()
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=2))
         ctl.probe_capabilities(camera)
-        scores = iter([10.0, 8.0, 10.0, 8.0])
+        scores = iter([10.0, 8.0, 8.0, 8.0])
         with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
-            with pytest.raises(AutofocusError, match="before=10.0 after=8.0"):
-                await ctl.run_autofocus(camera, sharpness_threshold=48.0)
+            with pytest.raises(AutofocusError, match="after=8.0"):
+                await ctl.run_autofocus(camera, sharpness_threshold=48.0, preview_roi=(20, 20, 80, 60))
         assert camera.cycle_calls == 2
 
     @pytest.mark.asyncio

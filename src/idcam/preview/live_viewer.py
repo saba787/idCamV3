@@ -39,6 +39,7 @@ class DebugSnapshot:
     timestamp: float = 0.0
     state: str = "BOOT"
     document_detected: bool = False
+    document_locked: bool = False
     motion: float = 0.0
     edge_density: float = 0.0
     motion_threshold: float = 8.0
@@ -199,43 +200,38 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     if debug_frame.ndim == 2:
         debug_frame = cv2.cvtColor(debug_frame, cv2.COLOR_GRAY2RGB)
 
-    frac = snapshot.roi_center_fraction
-    h, w = debug_frame.shape[:2]
-    rh, rw = int(h * frac), int(w * frac)
-    y0, x0 = (h - rh) // 2, (w - rw) // 2
-    cv2.rectangle(debug_frame, (x0, y0), (x0 + rw, y0 + rh), (0, 180, 60), 1)
     doc_roi = _parse_roi(snapshot.document_roi)
-    if doc_roi is not None:
+    if doc_roi is not None and snapshot.document_locked:
         dx, dy, dw, dh = doc_roi
         cv2.rectangle(debug_frame, (dx, dy), (dx + dw, dy + dh), (80, 180, 255), 2)
-    focus_roi = _parse_roi(snapshot.preview_focus_roi or snapshot.focus_roi)
-    if focus_roi is not None and focus_roi != doc_roi:
-        fx, fy, fw, fh = focus_roi
-        cv2.rectangle(debug_frame, (fx, fy), (fx + fw, fy + fh), (0, 220, 255), 2)
 
     camera = "OK" if snapshot.camera_healthy else "ERROR"
     if not snapshot.camera_healthy and snapshot.waiting_for_camera and not snapshot.camera_error:
         camera = "WAITING"
     document = "YES" if snapshot.document_detected else "NO"
+    locked = "YES" if snapshot.document_locked else "NO"
     banner = None
     if snapshot.waiting_for_camera and not snapshot.camera_error:
         banner = "WAITING FOR CAMERA..."
     if snapshot.camera_error or (not snapshot.camera_healthy and not snapshot.waiting_for_camera):
         banner = "CAMERA ERROR"
 
+    focus_status = snapshot.autofocus_method or "-"
+    if snapshot.autofocus_running:
+        focus_status = "running"
+    capture_status = "—"
+    if snapshot.capture_started:
+        capture_status = "started"
+    if snapshot.upload_started:
+        capture_status = "uploading"
+    if snapshot.upload_result:
+        capture_status = snapshot.upload_result
+
     lines = [
         f"STATE: {snapshot.state}",
-        f"DOCUMENT: {document}",
-        f"MOTION: {snapshot.motion:.2f}  EDGE: {snapshot.edge_density:.4f}",
-        f"STABLE: {snapshot.stable_count}/{snapshot.stable_required} "
-        f"motion={snapshot.stability_motion:.2f}/{snapshot.stability_threshold:.2f}",
-        f"AF: {snapshot.autofocus_method or '-'} "
-        f"{snapshot.focus_before:.1f}->{snapshot.focus_after:.1f} x{snapshot.improvement_ratio:.2f}",
-        f"DOC ROI: {snapshot.document_roi or '-'}",
-        f"FOCUS ROI: {snapshot.preview_focus_roi or snapshot.focus_roi or '-'}",
-        f"REMOVAL: {snapshot.removal_count} empty={snapshot.removal_detected}",
-        f"PIPELINE: cap={snapshot.capture_started} up={snapshot.upload_started} {snapshot.upload_result or '-'}",
-        f"REASON: {snapshot.state_reason or '-'}",
+        f"DOCUMENT: {document}  LOCKED: {locked}",
+        f"FOCUS: {focus_status} {snapshot.focus_before:.1f}->{snapshot.focus_after:.1f}",
+        f"CAPTURE: {capture_status}",
         f"FPS: {fps:.1f}  CAMERA: {camera}",
     ]
     if snapshot.camera_error and not snapshot.camera_healthy:
@@ -317,28 +313,12 @@ _HTML_PAGE = """<!DOCTYPE html>
     <aside>
       <dl>
         <dt>State</dt><dd id="state">—</dd>
-        <dt>Camera</dt><dd id="camera">—</dd>
-        <dt>Detection</dt><dd id="detection">—</dd>
-        <dt>Reject reason</dt><dd id="reject">—</dd>
-        <dt>Motion</dt><dd id="motion">—</dd>
-        <dt>Frame motion</dt><dd id="framemotion">—</dd>
-        <dt>Edge density</dt><dd id="edge">—</dd>
-        <dt>ROI</dt><dd id="roi">—</dd>
-        <dt>Frame</dt><dd id="frame">—</dd>
-        <dt>Gray std</dt><dd id="graystd">—</dd>
-        <dt>Stable frames</dt><dd id="stable">—</dd>
-        <dt>Stability motion</dt><dd id="stabmotion">—</dd>
-        <dt>Removal</dt><dd id="removal">—</dd>
-        <dt>Autofocus</dt><dd id="af">—</dd>
-        <dt>Focus ROI (preview)</dt><dd id="focusroi">—</dd>
-        <dt>Sensor AF ROI</dt><dd id="sensorroi">—</dd>
-        <dt>Document ROI</dt><dd id="docroi">—</dd>
-        <dt>Lens</dt><dd id="lens">—</dd>
-        <dt>Sharpness ratio</dt><dd id="ratio">—</dd>
-        <dt>State reason</dt><dd id="reason">—</dd>
-        <dt>Capture / upload</dt><dd id="pipeline">—</dd>
+        <dt>Document</dt><dd id="detection">—</dd>
+        <dt>Locked</dt><dd id="locked">—</dd>
+        <dt>Focus</dt><dd id="af">—</dd>
+        <dt>Capture</dt><dd id="capture">—</dd>
+        <dt>Upload</dt><dd id="upload">—</dd>
         <dt>FPS</dt><dd id="fps">—</dd>
-        <dt>Timestamp</dt><dd id="timestamp">—</dd>
       </dl>
       <button id="capture" type="button">Capture &amp; Send</button>
       <div id="manual" class="manual">Idle</div>
@@ -371,31 +351,12 @@ _HTML_PAGE = """<!DOCTYPE html>
         if (!r.ok) throw new Error("status " + r.status);
         const d = await r.json();
         el("state").textContent = d.state || "—";
-        el("camera").textContent = d.camera_healthy ? "healthy" : "unhealthy";
         el("detection").textContent = d.document_detected ? "detected" : "not detected";
-        el("reject").textContent = d.reject_reason || "—";
-        el("motion").textContent = Number(d.motion).toFixed(2);
-        el("framemotion").textContent = Number(d.frame_motion || 0).toFixed(2);
-        el("edge").textContent = Number(d.edge_density).toFixed(4);
-        el("roi").textContent = (d.roi_width || 0) + " x " + (d.roi_height || 0);
-        const fr = d.frame || {};
-        const shape = fr.shape ? fr.shape.join("x") : ((d.frame_width || "—") + "x" + (d.frame_height || "—"));
-        el("frame").textContent = shape + " " + (fr.dtype || "") + " " + (fr.channel_order || "");
-        el("graystd").textContent = Number(d.gray_std || 0).toFixed(2);
-        el("stable").textContent = (d.stable_count ?? 0) + " / " + (d.stable_required ?? 0);
-        el("stabmotion").textContent = Number(d.stability_motion || 0).toFixed(2) + " / " + Number(d.stability_threshold || 0).toFixed(2);
-        el("removal").textContent = (d.removal_detected ? "empty" : "document still present") + " (" + (d.removal_count ?? 0) + ")";
+        el("locked").textContent = d.document_locked ? "yes" : "no";
         el("af").textContent = (d.autofocus_method || "—") + " " + Number(d.focus_before || 0).toFixed(1) + "→" + Number(d.focus_after || 0).toFixed(1);
-        el("focusroi").textContent = d.preview_focus_roi || d.focus_roi || "—";
-        el("sensorroi").textContent = d.sensor_focus_roi || "—";
-        el("docroi").textContent = d.document_roi || "—";
-        el("lens").textContent = (d.lens_before == null ? "—" : Number(d.lens_before).toFixed(2)) + " → " + (d.lens_after == null ? "—" : Number(d.lens_after).toFixed(2));
-        el("ratio").textContent = Number(d.improvement_ratio || 0).toFixed(2);
-        el("reason").textContent = d.state_reason || "—";
-        el("pipeline").textContent = "manual=" + (d.manual_capture_requested ? "yes" : "no") + " capture=" + (d.capture_started ? "yes" : "no") + " upload=" + (d.upload_started ? "yes" : "no") + " " + (d.upload_result || "—");
+        el("capture").textContent = d.capture_started ? "started" : "—";
+        el("upload").textContent = d.upload_started ? (d.upload_result || "uploading") : (d.upload_result || "—");
         el("fps").textContent = Number(d.fps).toFixed(1);
-        const ts = d.timestamp ? new Date(d.timestamp * 1000).toISOString() : "—";
-        el("timestamp").textContent = ts;
         const btn = el("capture");
         btn.disabled = capturing || d.manual_capture_available === false;
         const box = el("manual");
@@ -407,7 +368,7 @@ _HTML_PAGE = """<!DOCTYPE html>
           box.className = "manual" + (d.manual_phase === "failed" ? " error" : d.manual_phase === "success" ? " ok" : "");
         }
       } catch (err) {
-        el("camera").textContent = "unhealthy";
+        el("fps").textContent = "—";
       }
     }
     el("capture").addEventListener("click", async () => {
@@ -683,6 +644,7 @@ class LiveDebugViewer:
         *,
         state: str,
         document_detected: bool,
+        document_locked: bool = False,
         motion: float,
         edge_density: float,
         motion_threshold: float,
@@ -744,6 +706,7 @@ class LiveDebugViewer:
                 timestamp=time.time(),
                 state=state,
                 document_detected=document_detected,
+                document_locked=document_locked,
                 motion=motion,
                 edge_density=edge_density,
                 motion_threshold=motion_threshold,
@@ -809,6 +772,7 @@ class LiveDebugViewer:
             "enabled": True,
             "state": snap.state,
             "document_detected": snap.document_detected,
+            "document_locked": snap.document_locked,
             "motion": snap.motion,
             "edge_density": snap.edge_density,
             "motion_threshold": snap.motion_threshold,

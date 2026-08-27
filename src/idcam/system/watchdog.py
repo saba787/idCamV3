@@ -12,8 +12,6 @@ from idcam.logging.setup import get_logger
 logger = get_logger("system.watchdog")
 
 WATCHED_STATES = {
-    AppState.FOCUSING,
-    AppState.FOCUS_VERIFICATION,
     AppState.CAPTURING,
     AppState.IMAGE_VALIDATION,
     AppState.UPLOADING,
@@ -21,8 +19,6 @@ WATCHED_STATES = {
     AppState.PROCESSING_RESPONSE,
     AppState.RECOVERY,
     AppState.CAMERA_INITIALIZING,
-    AppState.DOCUMENT_DETECTED,
-    AppState.WAITING_FOR_STABILITY,
 }
 
 

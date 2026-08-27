@@ -97,6 +97,7 @@ class TestAutoCapturePath:
         orch = _orch(app_config)
         orch.sm.state = AppState.DOCUMENT_DETECTED
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
         await orch._document_detected_tick()
         assert orch.sm.state == AppState.WAITING_FOR_STABILITY
 
@@ -128,8 +129,6 @@ class TestAutoCapturePath:
             return_value=AutofocusResult(True, 90.0, 0, None, "verification", 10.0)
         )
         await orch._focusing_tick()
-        assert orch.sm.state == AppState.FOCUS_VERIFICATION
-        await orch._focus_verification_tick()
         assert orch.sm.state == AppState.CAPTURING
 
     @pytest.mark.asyncio
@@ -207,8 +206,6 @@ class TestAutoDetectStableFocusCapture:
                 break
         assert orch.sm.state == AppState.FOCUSING
         await orch._focusing_tick()
-        assert orch.sm.state == AppState.FOCUS_VERIFICATION
-        await orch._focus_verification_tick()
         assert orch.sm.state == AppState.CAPTURING
         await orch._capturing_tick()
         assert orch.sm.state == AppState.IMAGE_VALIDATION

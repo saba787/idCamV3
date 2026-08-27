@@ -39,7 +39,7 @@ from idcam.storage.temp_files import TempFileStore
 from idcam.system.component_health import ComponentStatus, HealthLevel, SystemHealth
 from idcam.system.watchdog import Watchdog
 from idcam.ui.status import StatusPublisher
-from idcam.vision.document_detector import DocumentDetector, DocumentPresence
+from idcam.vision.document_detector import DocumentDetector
 from idcam.vision.stability_detector import StabilityDetector
 
 logger = get_logger("orchestrator")
@@ -72,7 +72,7 @@ class ApplicationOrchestrator:
         self.health = SystemHealth()
         self.status = StatusPublisher(config.ui.status_file, version=__version__)
         self.camera = CameraManager(config.camera, use_mock=use_mock_camera)
-        self.autofocus = AutofocusController(config.camera)
+        self.autofocus = AutofocusController(config.camera, config.quality)
         self.temp_store = TempFileStore(config.temp_dir)
         self.capture_service = CaptureService(config.camera, self.temp_store)
         self.validator = ImageValidator(config.quality, config.camera)
@@ -307,14 +307,22 @@ class ApplicationOrchestrator:
             return None
 
     async def _check_motion_abort(self) -> bool:
-        """Return False if document moved and transaction was failed."""
+        """Return False if locked document moved significantly (not AE noise)."""
         frame = await self._safe_preview()
         if frame is None:
             return False
-        moving = self.detector.classify(frame) == DocumentPresence.DOCUMENT_MOVING
+        if not self.detector.lock.is_locked:
+            return True
+        motion = self.detector.structural_motion_in_lock(frame)
+        threshold = self.config.detection.motion_threshold * 2.5
         self._publish_debug(frame)
-        if moving:
-            logger.warning("event=document_moved_during_capture_phase state=%s", self.sm.state.value)
+        if motion > threshold:
+            logger.warning(
+                "event=document_moved_during_capture state=%s motion=%.2f threshold=%.2f",
+                self.sm.state.value,
+                motion,
+                threshold,
+            )
             await self._fail_transaction_and_wait("stability_timeout", "Document moved during capture")
             return False
         return True
@@ -494,6 +502,12 @@ class ApplicationOrchestrator:
     async def _document_detected_tick(self) -> None:
         if not self._claim_state_action():
             return
+        frame = await self._safe_preview()
+        if frame is not None:
+            self.detector.lock_document(frame)
+            self.stability.set_roi(self.detector.lock.roi)
+            self._publish_debug(frame)
+            logger.info("event=pipeline_stage stage=document_locked roi=%s", self.detector.lock.roi)
         if self._transaction and self._transaction.trigger == "manual":
             self._set_manual_phase("focusing", "Focusing...")
             self._transition(AppState.FOCUSING, reason="manual_capture_skip_stability")
@@ -504,23 +518,15 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return
-        presence = self.detector.classify(frame)
-        if presence == DocumentPresence.DOCUMENT_MOVING:
-            self.stability.reset()
-            self._publish_debug(frame)
-            self.sm.touch_progress()
-            return
         if self.stability.update(frame):
             self._publish_debug(frame)
             logger.info(
-                "event=document_stable frames=%d stability_motion=%.2f threshold=%.2f",
+                "event=pipeline_stage stage=stability_confirmed frames=%d motion=%.2f",
                 self.stability.stable_count,
                 self.stability.debug_info().motion,
-                self.stability.debug_info().threshold,
             )
             assert self._transaction is not None
             self._transaction.phase = TransactionPhase.STABILIZING
-            logger.info("event=pipeline_stage stage=focusing reason=document_stable")
             self._set_manual_phase("focusing", "Focusing...")
             self._transition(AppState.FOCUSING, reason="document_stable")
         else:
@@ -542,31 +548,21 @@ class ApplicationOrchestrator:
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
         self._set_manual_phase("focusing", "Focusing...")
-        logger.info(
-            "event=pipeline_stage stage=focusing capture_id=%s preview_roi=%s",
-            self._transaction.capture_id,
-            preview_roi,
-        )
-        min_sharp = self.config.quality.min_sharpness * 0.6
         try:
             result = await self.autofocus.run_autofocus(
                 self.camera,
-                sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
                 preview_roi=preview_roi,
             )
-            pause = getattr(self.camera, "pause_autofocus", None)
-            if callable(pause):
-                await asyncio.to_thread(pause)
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
             logger.info(
-                "event=pipeline_stage stage=focus_verification method=%s sharpness=%.1f ratio=%.2f",
+                "event=pipeline_stage stage=focus_verified method=%s sharpness=%.1f ratio=%.2f",
                 result.method,
                 result.sharpness,
                 result.improvement_ratio,
             )
-            self._transition(AppState.FOCUS_VERIFICATION, reason="autofocus_accepted")
+            self._transition(AppState.CAPTURING, reason="focus_verified")
         except AutofocusError as exc:
             logger.error("event=autofocus_failed %s", exc)
             await self._fail_transaction_and_wait("focus_failed", str(exc))
@@ -575,13 +571,11 @@ class ApplicationOrchestrator:
         if not self._claim_state_action():
             return
         assert self._transaction is not None
-        min_sharp = self.config.quality.min_sharpness * 0.6
         self._transaction.focus_verify_attempts += 1
         preview_roi = self.detector.focus_preview_roi()
         try:
             result = await self.autofocus.verify_focus(
                 self.camera,
-                sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
                 preview_roi=preview_roi,
             )
@@ -830,6 +824,18 @@ class ApplicationOrchestrator:
             self._error_backoff_claimed = False
 
     async def _handle_watchdog(self, alert) -> None:
+        state = alert.state
+        if state in {
+            AppState.IMAGE_VALIDATION,
+            AppState.UPLOADING,
+            AppState.WAITING_FOR_SERVER,
+            AppState.PROCESSING_RESPONSE,
+        }:
+            await self._fail_transaction_and_wait("timeout", f"watchdog:{alert.reason}")
+            return
+        if state == AppState.CAPTURING:
+            await self._enter_recovery(f"watchdog:{alert.reason}")
+            return
         await self._enter_recovery(f"watchdog:{alert.reason}")
 
     async def _enter_recovery(self, reason: str) -> None:
@@ -921,6 +927,7 @@ class ApplicationOrchestrator:
         self._transaction = None
         self._capture_path = None
         self._pending_response = None
+        self.detector.release_lock()
         set_log_context(capture_id=None)
 
     def _refresh_health(self) -> None:
@@ -1008,6 +1015,7 @@ class ApplicationOrchestrator:
             frame,
             state=self.sm.state.value,
             document_detected=doc.detected,
+            document_locked=doc.document_locked,
             motion=doc.motion,
             edge_density=doc.edge_density,
             motion_threshold=doc.motion_threshold,

@@ -146,7 +146,7 @@ class TestMotionDuringCapture:
         with patch.object(orch, "_fail_transaction_and_wait", AsyncMock()) as fail_mock:
             await orch._focusing_tick()
             fail_mock.assert_not_called()
-        assert orch.sm.state == AppState.FOCUS_VERIFICATION
+        assert orch.sm.state == AppState.CAPTURING
 
 
 class TestShutdown:

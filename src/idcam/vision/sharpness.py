@@ -1,4 +1,4 @@
-"""Image sharpness measurement."""
+"""Image sharpness measurement — preview vs still-image scales differ."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import numpy as np
 
 
 def roi_rect(frame_shape: tuple[int, ...], roi_fraction: float = 0.7) -> tuple[int, int, int, int]:
-    """Centered ROI as (x, y, width, height) in frame pixels."""
     h, w = int(frame_shape[0]), int(frame_shape[1])
     frac = min(max(float(roi_fraction), 0.05), 1.0)
     rh, rw = max(1, int(h * frac)), max(1, int(w * frac))
@@ -30,7 +29,6 @@ def inner_roi(
     inset_fraction: float = 0.12,
     frame_shape: tuple[int, ...] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Inset document bbox to avoid borders/background in focus measurement."""
     x, y, rw, rh = (int(v) for v in roi)
     inset_fraction = min(max(float(inset_fraction), 0.0), 0.4)
     dx = max(1, int(rw * inset_fraction))
@@ -41,24 +39,47 @@ def inner_roi(
     return inner
 
 
+def _gray_patch(frame: np.ndarray, roi: tuple[int, int, int, int] | None, roi_fraction: float) -> np.ndarray:
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = frame
+    if roi is None:
+        x0, y0, rw, rh = roi_rect(gray.shape, roi_fraction)
+    else:
+        x0, y0, rw, rh = clip_roi(roi, gray.shape)
+    return gray[y0 : y0 + rh, x0 : x0 + rw]
+
+
 def laplacian_variance(
     frame: np.ndarray,
     roi_fraction: float = 0.7,
     roi: tuple[int, int, int, int] | None = None,
 ) -> float:
-    """Laplacian variance on a preview-pixel ROI. Higher is sharper."""
-    if frame.ndim == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = frame
-
-    if roi is None:
-        x0, y0, rw, rh = roi_rect(gray.shape, roi_fraction)
-    else:
-        x0, y0, rw, rh = clip_roi(roi, gray.shape)
-    patch = gray[y0 : y0 + rh, x0 : x0 + rw]
+    patch = _gray_patch(frame, roi, roi_fraction)
     laplacian = cv2.Laplacian(patch, cv2.CV_64F)
     return float(laplacian.var())
+
+
+def tenengrad_score(
+    frame: np.ndarray,
+    roi: tuple[int, int, int, int] | None = None,
+    roi_fraction: float = 0.7,
+) -> float:
+    """Gradient-energy sharpness for 1080p preview. Correlates better than Laplacian var at low res."""
+    patch = _gray_patch(frame, roi, roi_fraction)
+    gx = cv2.Sobel(patch, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch, cv2.CV_64F, 0, 1, ksize=3)
+    return float(np.mean(gx * gx + gy * gy))
+
+
+def preview_sharpness(
+    frame: np.ndarray,
+    roi: tuple[int, int, int, int] | None = None,
+    roi_fraction: float = 0.7,
+) -> float:
+    """Primary preview focus metric (Tenengrad mean energy)."""
+    return tenengrad_score(frame, roi=roi, roi_fraction=roi_fraction)
 
 
 def accept_preview_focus(
@@ -66,22 +87,18 @@ def accept_preview_focus(
     before: float,
     after: float,
     absolute_floor: float,
-    min_ratio: float = 1.2,
-    min_delta: float = 2.0,
+    min_ratio: float = 1.15,
+    min_delta: float = 1.5,
 ) -> bool:
-    """Accept preview AF from relative improvement; absolute floor is not a veto.
-
-    10 → 30 succeeds even when floor is 48.
-    10 → 8 fails.
-    """
-    if after < 0:
+    """Accept preview AF from meaningful improvement — not still-image thresholds."""
+    if after <= 0:
         return False
     if before <= 0:
-        return after >= max(absolute_floor, min_delta)
+        return after >= absolute_floor
     ratio = after / before
     if ratio >= min_ratio and (after - before) >= min_delta:
         return True
-    if after >= absolute_floor and after >= before * 0.95:
+    if after >= absolute_floor and after >= before * 0.92:
         return True
     return False
 

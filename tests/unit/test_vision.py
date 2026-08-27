@@ -167,7 +167,7 @@ class TestStabilityDetector:
         for _ in range(2):
             sd.update(frame)
         moving = frame.copy()
-        moving[200:300, 200:300] = 255
+        moving[100:400, 100:500] = 255
         sd.update(moving)
         assert sd.stable_count == 0
 

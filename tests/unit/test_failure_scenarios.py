@@ -111,10 +111,10 @@ class TestFailureScenarios:
         assert not sm.can_transition(AppState.DOCUMENT_DETECTED)
 
     # 18. Stuck state detection
-    def test_watchdog_stuck_focusing(self):
-        timeouts = StateTimeoutsConfig(focusing=10.0)
+    def test_watchdog_stuck_capturing(self):
+        timeouts = StateTimeoutsConfig(capturing=10.0)
         wd = Watchdog(WatchdogConfig(), timeouts)
-        sm = StateMachine(state=AppState.FOCUSING)
+        sm = StateMachine(state=AppState.CAPTURING)
         sm.set_timeouts(timeouts)
         sm.entered_at = time.monotonic() - 20
         sm.last_progress_at = time.monotonic() - 20

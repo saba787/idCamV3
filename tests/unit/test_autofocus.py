@@ -119,6 +119,12 @@ class TestAutofocusController:
                     return _sharp_frame()
                 return np.full((120, 160, 3), 128, dtype=np.uint8)
 
+            def trigger_autofocus(self) -> None:
+                self.set_controls({"AfMode": 1, "AfTrigger": 0})
+
+            def wait_for_lens_settle(self, timeout: float = 3.5) -> None:
+                return None
+
         camera = NeedsTrigger(has_cycle=False)
         camera.advertised["AfState"] = (0, 3, 0)
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
@@ -139,6 +145,12 @@ class TestAutofocusController:
                 if self.set_calls:
                     return _sharp_frame()
                 return np.full((120, 160, 3), 128, dtype=np.uint8)
+
+            def trigger_autofocus(self) -> None:
+                self.set_controls({"AfMode": 1, "AfTrigger": 0})
+
+            def wait_for_lens_settle(self, timeout: float = 3.5) -> None:
+                return None
 
         camera = NeedsTrigger(has_cycle=False, metadata={"LensPosition": 0.8})
         ctl = AutofocusController(CameraConfig(af_timeout_sec=2.0, af_max_retries=1))
@@ -224,7 +236,7 @@ class TestPreviewFocusAcceptance:
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
         ctl.probe_capabilities(camera)
         scores = iter([10.0, 30.0])
-        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
+        with patch("idcam.camera.autofocus.preview_sharpness", side_effect=lambda *_a, **_k: next(scores)):
             result = await ctl.run_autofocus(camera, sharpness_threshold=48.0)
         assert result.success is True
         assert result.before_sharpness == 10.0
@@ -238,7 +250,7 @@ class TestPreviewFocusAcceptance:
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=2))
         ctl.probe_capabilities(camera)
         scores = iter([10.0, 8.0, 8.0, 8.0])
-        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
+        with patch("idcam.camera.autofocus.preview_sharpness", side_effect=lambda *_a, **_k: next(scores)):
             with pytest.raises(AutofocusError, match="after=8.0"):
                 await ctl.run_autofocus(camera, sharpness_threshold=48.0, preview_roi=(20, 20, 80, 60))
         assert camera.cycle_calls == 2
@@ -251,7 +263,7 @@ class TestPreviewFocusAcceptance:
         ctl.debug.focus_before = 10.0
         ctl.debug.focus_after = 30.0
         ctl._last_preview_roi = (20, 20, 80, 60)
-        with patch("idcam.camera.autofocus.laplacian_variance", return_value=28.0):
+        with patch("idcam.camera.autofocus.preview_sharpness", return_value=28.0):
             result = await ctl.verify_focus(camera, sharpness_threshold=48.0)
         assert result.success is True
         assert result.sharpness == 28.0

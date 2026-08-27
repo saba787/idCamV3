@@ -64,8 +64,8 @@ class CameraConfig(BaseModel):
     capture_height: int = Field(6944, ge=480)
     jpeg_quality: int = Field(95, ge=50, le=100)
     preview_fps: float = Field(5.0, gt=0, le=30)
-    af_max_retries: int = Field(2, ge=1, le=10)
-    af_timeout_sec: float = Field(10.0, gt=0, le=120)
+    af_max_retries: int = Field(1, ge=1, le=10)
+    af_timeout_sec: float = Field(6.0, gt=0, le=120)
     af_verify_max_retries: int = Field(2, ge=1, le=5)
     capture_timeout_sec: float = Field(45.0, gt=0, le=300)
     recovery: CameraRecoveryConfig = CameraRecoveryConfig()
@@ -91,12 +91,16 @@ class DetectionConfig(BaseModel):
     lose_edge_factor: float = Field(0.55, gt=0, le=2.0)
     stability_exit_factor: float = Field(2.0, gt=1.0, le=5.0)
     focus_roi_inset_fraction: float = Field(0.12, gt=0.0, le=0.4)
+    roi_smooth_alpha: float = Field(0.25, gt=0.05, le=1.0)
     removal_motion_factor: float = Field(0.5, gt=0, le=1.0)
     removal_edge_factor: float = Field(0.5, gt=0, le=2.0)
     baseline_alpha: float = Field(0.05, gt=0, le=1.0)
 
 
 class QualityConfig(BaseModel):
+    preview_min_sharpness: float = Field(18.0, gt=0)
+    preview_focus_min_ratio: float = Field(1.15, gt=1.0, le=3.0)
+    preview_focus_min_delta: float = Field(1.5, gt=0)
     min_sharpness: float = Field(80.0, gt=0)
     min_file_bytes: int = Field(100_000, gt=0)
     max_file_bytes: int = Field(50_000_000, gt=0)

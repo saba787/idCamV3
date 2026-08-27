@@ -35,3 +35,18 @@ class TestDocumentGeometry:
         ordered = order_corners(pts)
         assert ordered[0][1] <= ordered[2][1]
         assert ordered[0][0] <= ordered[1][0]
+
+    def test_scan_reports_rejected_candidates(self):
+        frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+        from idcam.vision.document_geometry import scan_document_candidates
+
+        best, reports = scan_document_candidates(frame)
+        assert best is None
+        assert isinstance(reports, list)
+
+    def test_scan_accepts_document_frame(self):
+        from idcam.vision.document_geometry import scan_document_candidates
+
+        best, reports = scan_document_candidates(_document_frame())
+        assert best is not None
+        assert any(r.accepted for r in reports)

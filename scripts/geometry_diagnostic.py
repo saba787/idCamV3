@@ -6,10 +6,12 @@ Saves:
   /tmp/idcam-preview.jpg
   /tmp/idcam-geometry-debug.jpg
 
-Prints JSON with channel analysis and every geometry candidate.
+Prints JSON with channel analysis and geometry candidate report.
 
 Usage:
-  /opt/idcam/venv/bin/python scripts/geometry_diagnostic.py --config /etc/idcam/config.yaml
+  sudo systemctl stop idcam
+  sudo -u idcam /opt/idcam/venv/bin/python scripts/geometry_diagnostic.py \
+      --config /etc/idcam/config.yaml
 """
 
 from __future__ import annotations
@@ -27,8 +29,7 @@ from idcam.camera.diagnostic import (
     save_rgb_jpeg,
 )
 from idcam.camera.manager import CameraManager
-from idcam.config.loader import load_config
-from idcam.config.schema import CameraConfig
+from idcam.config.loader import load_camera_config_for_diagnostic
 from idcam.vision.document_geometry import draw_geometry_debug_image, scan_document_candidates
 
 
@@ -41,8 +42,25 @@ def _candidate_dict(c) -> dict:
         "aspect_ratio": round(c.aspect_ratio, 3),
         "rectangularity": round(c.rectangularity, 3),
         "edge_strength": round(c.edge_strength, 2),
+        "contrast_score": round(c.contrast_score, 4),
         "final_score": round(c.final_score, 3),
         "rejection_reason": c.rejection_reason,
+        "source_method": c.source_method,
+    }
+
+
+def _document_dict(best) -> dict:
+    return {
+        "document_bbox": list(best.bbox),
+        "document_corners": [list(p) for p in best.corners],
+        "confidence": round(best.confidence, 3),
+        "area_fraction": round(best.area_fraction, 4),
+        "area_percent": round(best.area_fraction * 100, 1),
+        "aspect_ratio": round(best.aspect_ratio, 3),
+        "rotation": round(best.rotation_deg, 2),
+        "rectangularity": round(best.rectangularity, 3),
+        "detection_method": best.detection_method,
+        "contrast_score": round(best.contrast_score, 4),
     }
 
 
@@ -55,13 +73,9 @@ def main() -> int:
     args = parser.parse_args()
 
     report: dict = {"ok": False}
-
-    try:
-        config = load_config(args.config)
-        camera_cfg = config.camera
-    except Exception as exc:
-        report["config_error"] = str(exc)
-        camera_cfg = CameraConfig()
+    camera_cfg, config_warnings = load_camera_config_for_diagnostic(args.config)
+    if config_warnings:
+        report.update(config_warnings)
 
     mgr = CameraManager(camera_cfg, use_mock=args.mock)
 
@@ -84,21 +98,19 @@ def main() -> int:
 
         if best is None:
             reason = "no_contour_passed_filters" if candidates else "no_contours_found"
+            near_miss = None
+            for c in candidates:
+                if c.bbox[2] > 0 and c.bbox[3] > 0:
+                    near_miss = c
+                    break
             report["document_detected"] = False
             report["reason"] = reason
-            draw_geometry_debug_image(rgb, None, args.geometry_debug, reason=reason)
+            draw_geometry_debug_image(rgb, None, args.geometry_debug, reason=reason, near_miss=near_miss)
         else:
             report["document_detected"] = True
-            report["document"] = {
-                "bbox": list(best.bbox),
-                "corners": [list(p) for p in best.corners],
-                "confidence": round(best.confidence, 3),
-                "area_fraction": round(best.area_fraction, 4),
-                "area_percent": round(best.area_fraction * 100, 1),
-                "aspect_ratio": round(best.aspect_ratio, 3),
-                "rectangularity": round(best.rectangularity, 3),
-                "rotation_deg": round(best.rotation_deg, 2),
-            }
+            doc = _document_dict(best)
+            report["document"] = doc
+            report.update(doc)
             draw_geometry_debug_image(rgb, best, args.geometry_debug)
 
         report["geometry_debug_path"] = str(args.geometry_debug)

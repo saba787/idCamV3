@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from idcam.config.schema import EXAMPLE_SERVER_HOSTS, AppConfig
+from idcam.config.schema import EXAMPLE_SERVER_HOSTS, AppConfig, CameraConfig
 from idcam.exceptions import ConfigurationError
 
 
@@ -24,7 +24,18 @@ def load_config(path: Path | None = None) -> AppConfig:
         raise ConfigurationError(f"Configuration file not found: {config_path}")
 
     try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw_text = config_path.read_text(encoding="utf-8")
+    except PermissionError as exc:
+        raise ConfigurationError(
+            f"Permission denied reading {config_path}. "
+            "Run diagnostics as the idcam user (sudo -u idcam ...) or set IDCAM_CONFIG "
+            "to a readable config path."
+        ) from exc
+    except OSError as exc:
+        raise ConfigurationError(f"Cannot read {config_path}: {exc}") from exc
+
+    try:
+        raw = yaml.safe_load(raw_text)
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"Invalid YAML in {config_path}: {exc}") from exc
 
@@ -42,6 +53,45 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     _enforce_production_endpoint(config)
     return config
+
+
+def load_camera_config_for_diagnostic(
+    path: Path | None = None,
+) -> tuple[CameraConfig, dict[str, str]]:
+    """
+  Load camera settings for hardware diagnostics.
+
+  Returns (camera_config, warnings). On failure uses CameraConfig defaults and
+  records a clear warning instead of silently ignoring permission errors.
+    """
+    warnings: dict[str, str] = {}
+    try:
+        return load_config(path).camera, warnings
+    except ConfigurationError as exc:
+        warnings["config_error"] = str(exc)
+        warnings["config_hint"] = (
+            "Stop idcam service, run as: sudo -u idcam /opt/idcam/venv/bin/python scripts/... "
+            "or export IDCAM_CONFIG=/path/to/readable/config.yaml"
+        )
+        camera = CameraConfig()
+        _apply_camera_env_overrides(camera)
+        return camera, warnings
+
+
+def _apply_camera_env_overrides(camera: CameraConfig) -> None:
+    """Allow diagnostics without YAML when env vars are set."""
+    pw = os.environ.get("IDCAM_PREVIEW_WIDTH")
+    ph = os.environ.get("IDCAM_PREVIEW_HEIGHT")
+    cw = os.environ.get("IDCAM_CAPTURE_WIDTH")
+    ch = os.environ.get("IDCAM_CAPTURE_HEIGHT")
+    if pw:
+        camera.preview_width = int(pw)
+    if ph:
+        camera.preview_height = int(ph)
+    if cw:
+        camera.capture_width = int(cw)
+    if ch:
+        camera.capture_height = int(ch)
 
 
 def _resolve_config_path() -> Path:

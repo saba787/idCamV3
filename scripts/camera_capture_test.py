@@ -33,8 +33,7 @@ from idcam.camera.diagnostic import (
     validate_jpeg_file,
 )
 from idcam.camera.manager import CameraManager, normalize_picamera_preview_frame
-from idcam.config.loader import load_config
-from idcam.config.schema import CameraConfig
+from idcam.config.loader import load_camera_config_for_diagnostic
 
 
 def _candidate_to_dict(c) -> dict:
@@ -48,6 +47,8 @@ def _candidate_to_dict(c) -> dict:
         "edge_strength": round(c.edge_strength, 2),
         "final_score": round(c.final_score, 3),
         "rejection_reason": c.rejection_reason,
+        "source_method": c.source_method,
+        "contrast_score": round(c.contrast_score, 4),
     }
 
 
@@ -87,18 +88,20 @@ def run_geometry_phase(rgb, report: dict, geometry_debug_path: Path) -> None:
         reason = "no_contour_passed_filters"
         if not candidates:
             reason = "no_contours_found"
+        near_miss = next((c for c in candidates if c.bbox[2] > 0 and c.bbox[3] > 0), None)
         report["document_detected"] = False
         report["document_reason"] = reason
-        draw_geometry_debug_image(rgb, None, geometry_debug_path, reason=reason)
+        draw_geometry_debug_image(rgb, None, geometry_debug_path, reason=reason, near_miss=near_miss)
     else:
         report["document_detected"] = True
         report["document"] = {
-            "bbox": list(best.bbox),
-            "corners": [list(p) for p in best.corners],
+            "document_bbox": list(best.bbox),
+            "document_corners": [list(p) for p in best.corners],
             "confidence": round(best.confidence, 3),
             "area_fraction": round(best.area_fraction, 4),
             "aspect_ratio": round(best.aspect_ratio, 3),
-            "rotation_deg": round(best.rotation_deg, 2),
+            "rotation": round(best.rotation_deg, 2),
+            "detection_method": best.detection_method,
         }
         draw_geometry_debug_image(rgb, best, geometry_debug_path)
     report["geometry_debug_path"] = str(geometry_debug_path)
@@ -187,12 +190,9 @@ def main() -> int:
 
     report: dict = {"ok": False, "phase": "raw_only" if args.raw_only else "capture_test"}
 
-    try:
-        config = load_config(args.config)
-        camera_cfg = config.camera
-    except Exception as exc:
-        report["config_error"] = str(exc)
-        camera_cfg = CameraConfig()
+    camera_cfg, config_warnings = load_camera_config_for_diagnostic(args.config)
+    if config_warnings:
+        report.update(config_warnings)
 
     mgr = CameraManager(camera_cfg, use_mock=args.mock)
 

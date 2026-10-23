@@ -50,9 +50,10 @@ class LedPattern:
 
 STARTING = LedPattern(BLUE, "pulse", 2.0)
 READY = LedPattern(WHITE)
-# Detection through capture stays one steady colour so the light on the
-# document does not change while autofocus and the still capture run.
-DOCUMENT = LedPattern(YELLOW)
+# Detection through capture reuses the ready pattern itself, so the strip
+# stays the same steady white from IDLE through autofocus and the still
+# capture and the light on the document never changes mid-capture.
+DOCUMENT = READY
 PROCESSING = LedPattern(BLUE, "blink", 0.6)
 DONE = LedPattern(GREEN)
 RECOVERING = LedPattern(YELLOW, "blink", 1.0)
@@ -164,6 +165,8 @@ class LedIndicator:
     def set_state(self, state: AppState) -> None:
         pattern = STATE_PATTERNS.get(state, FAULT)
         with self._lock:
+            if state == AppState.SHUTDOWN:
+                self._flash = None
             if pattern is not self._pattern:
                 self._pattern = pattern
                 self._pattern_since = time.monotonic()

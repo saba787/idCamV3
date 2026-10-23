@@ -184,19 +184,20 @@ idCam logs `event=led_unavailable` and carries on.
 | Colour | Meaning |
 |--------|---------|
 | Blue, pulsing | Starting up / initializing camera |
-| White | Ready — place a document |
-| Yellow | Document detected, hold still; focusing and capturing |
+| White | Ready — place a document; stays white through detection, focusing and capture |
 | Blue, blinking | Validating and uploading |
 | Green | Done — remove the document |
-| Red flash | Capture or upload failed |
+| Red for 2 s | Capture or upload failed, then back to the current state's colour |
 | Yellow, blinking | Recovering |
 | Red, blinking | Error (e.g. low storage) |
 | Off | Shut down |
 
 If the strip lights the capture area, the colour change between states also
-changes the scene the detector sees. The colour is held steady from document
-detection through the still capture for that reason; lower `led.brightness`
-or aim the strip away from the document if detection becomes unreliable.
+changes the scene the detector sees. The strip therefore stays the same white
+from "ready" through detection, autofocus and the still capture; it changes
+only after the capture (blue for upload, green when done). Lower
+`led.brightness` or aim the strip away from the document if removal detection
+becomes unreliable.
 
 ## User Status
 

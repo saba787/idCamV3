@@ -201,6 +201,17 @@ class DebugConfig(BaseModel):
         return stripped
 
 
+class LedConfig(BaseModel):
+    """Optional WS2812B status strip on a Raspberry Pi 5 GPIO. Disabled by default."""
+
+    enabled: bool = False
+    gpio_pin: int = Field(18, ge=0, le=27)
+    count: int = Field(30, ge=1, le=1024)
+    brightness: float = Field(0.2, ge=0.0, le=1.0)
+    byteorder: Literal["GRB", "RGB", "GRBW", "RGBW"] = "GRB"
+    failure_flash_sec: float = Field(2.0, ge=0.0, le=30.0)
+
+
 class AppConfig(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=128)
     temp_dir: Path = Path("/var/lib/idcam/tmp")
@@ -215,6 +226,7 @@ class AppConfig(BaseModel):
     ui: UIConfig = UIConfig()
     watchdog: WatchdogConfig = WatchdogConfig()
     debug: DebugConfig = DebugConfig()
+    led: LedConfig = LedConfig()
 
     @field_validator("device_id")
     @classmethod

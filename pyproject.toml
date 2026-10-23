@@ -23,6 +23,11 @@ dependencies = [
 pi = [
     "picamera2>=0.3.22",
 ]
+led = [
+    "Adafruit-Blinka>=8.0",
+    "adafruit-circuitpython-pixelbuf>=2.0",
+    "Adafruit-Blinka-Raspberry-Pi5-Neopixel>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

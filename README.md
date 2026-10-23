@@ -168,6 +168,36 @@ hostname -I
 
 Then open `http://<PI-IP>:8088/preview/live` (MJPEG: `/preview/live.mjpg`, JSON: `/preview/status`). Auth tokens are never shown.
 
+## Status LED strip (optional)
+
+A WS2812B strip on a Raspberry Pi 5 GPIO can show the device state. It is off
+by default and never blocks capture: if the libraries or hardware are missing,
+idCam logs `event=led_unavailable` and carries on.
+
+1. Wire the strip data line to GPIO18 (physical pin 12), with a common ground.
+2. Install with the LED libraries: `sudo ./scripts/install.sh --with-led`
+   (adds the `gpio` group to the service user so it can open `/dev/pio0`).
+3. Check the strip with the service stopped:
+   `sudo systemctl stop idcam && /opt/idcam/venv/bin/python scripts/ws2812_test.py`
+4. Set `led.enabled: true` in `/etc/idcam/config.yaml` and restart the service.
+
+| Colour | Meaning |
+|--------|---------|
+| Blue, pulsing | Starting up / initializing camera |
+| White | Ready — place a document |
+| Yellow | Document detected, hold still; focusing and capturing |
+| Blue, blinking | Validating and uploading |
+| Green | Done — remove the document |
+| Red flash | Capture or upload failed |
+| Yellow, blinking | Recovering |
+| Red, blinking | Error (e.g. low storage) |
+| Off | Shut down |
+
+If the strip lights the capture area, the colour change between states also
+changes the scene the detector sees. The colour is held steady from document
+detection through the still capture for that reason; lower `led.brightness`
+or aim the strip away from the document if detection becomes unreliable.
+
 ## User Status
 
 The application writes real-time status to `/run/idcam/status.json`:

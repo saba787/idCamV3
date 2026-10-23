@@ -54,6 +54,7 @@ SKIP_APT=0
 SKIP_CAMERA=0
 SKIP_PYTHON=0
 SKIP_SYSTEMD=0
+WITH_LED=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -86,6 +87,7 @@ Options:
   --skip-camera     Skip Arducam driver installation
   --skip-python     Skip venv/pip (layout-only / tests)
   --skip-systemd    Skip enabling systemd (unit file is still installed)
+  --with-led        Also install the WS2812B status LED libraries (Pi 5)
   --staging DIR     Install under DIR (no root, apt, useradd, or systemctl)
   -h, --help        Show this help
 
@@ -138,6 +140,7 @@ parse_args() {
             --skip-camera) SKIP_CAMERA=1; shift ;;
             --skip-python) SKIP_PYTHON=1; shift ;;
             --skip-systemd) SKIP_SYSTEMD=1; shift ;;
+            --with-led) WITH_LED=1; shift ;;
             --staging)
                 [[ -n "${2:-}" ]] || { echo "ERROR: --staging requires a directory" >&2; exit 2; }
                 STAGING_ROOT="$2"
@@ -420,7 +423,7 @@ create_user() {
         echo "User ${SERVICE_USER} already exists (not recreated)"
     fi
     local extra=""
-    for g in video render plugdev; do
+    for g in video render plugdev gpio; do
         if getent group "$g" >/dev/null; then
             usermod -aG "$g" "$SERVICE_USER"
             extra="${extra} ${g}"
@@ -529,7 +532,11 @@ install_application() {
     echo "Creating venv with --system-site-packages so Picamera2/libcamera come from apt"
     python3 -m venv --system-site-packages "$VENV_DIR"
     "${VENV_DIR}/bin/pip" install --upgrade pip wheel
-    "${VENV_DIR}/bin/pip" install "${PROJECT_DIR}"
+    if [[ "$WITH_LED" -eq 1 ]]; then
+        "${VENV_DIR}/bin/pip" install "${PROJECT_DIR}[led]"
+    else
+        "${VENV_DIR}/bin/pip" install "${PROJECT_DIR}"
+    fi
     printf '%s\n' "$IDC_VERSION" > "${INSTALL_DIR}/VERSION"
     if [[ -z "$STAGING_ROOT" ]]; then
         chown -R root:root "$INSTALL_DIR" || die "Could not chown ${INSTALL_DIR}"
@@ -542,9 +549,9 @@ install_application() {
 write_systemd_dropin() {
     local groups=()
     if [[ -n "$STAGING_ROOT" ]]; then
-        groups=(video render)
+        groups=(video render gpio)
     else
-        for g in video render; do
+        for g in video render gpio; do
             if getent group "$g" >/dev/null; then
                 groups+=("$g")
             fi

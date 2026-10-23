@@ -103,3 +103,16 @@ debug:
   jpeg_quality: 70
   max_width: 1280
   overlay: true
+
+# WS2812B status LED strip (Raspberry Pi 5) — off by default.
+# Needs the LED libraries: run the installer with --with-led.
+# White = ready and throughout detection / focusing / capturing,
+# blue blinking = validating and uploading, green = done (remove document),
+# red for 2 s = capture failed, yellow blinking = recovering, red blinking = error.
+led:
+  enabled: false
+  gpio_pin: 18          # BCM number; GPIO18 is physical pin 12
+  count: 30
+  brightness: 0.2       # 0.0 - 1.0
+  byteorder: GRB
+  failure_flash_sec: 2.0

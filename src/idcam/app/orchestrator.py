@@ -38,6 +38,7 @@ from idcam.storage.paths import ensure_writable_directory
 from idcam.storage.temp_files import TempFileStore
 from idcam.system.component_health import ComponentStatus, HealthLevel, SystemHealth
 from idcam.system.watchdog import Watchdog
+from idcam.ui.led import LedIndicator
 from idcam.ui.status import StatusPublisher
 from idcam.vision.document_detector import DocumentDetector
 from idcam.vision.stability_detector import StabilityDetector
@@ -81,6 +82,7 @@ class ApplicationOrchestrator:
         self.disk = DiskMonitor(config.storage, config.temp_dir)
         self.api = ApiClient(config)
         self.watchdog = Watchdog(config.watchdog, config.state_timeouts)
+        self.led = LedIndicator(config.led)
         self._shutdown_event = asyncio.Event()
         self._transaction: ActiveCaptureTransaction | None = None
         self._recovery_attempts = 0
@@ -136,7 +138,11 @@ class ApplicationOrchestrator:
             self._transition(AppState.ERROR, reason=str(exc))
             return 1
         finally:
-            await self._shutdown()
+            try:
+                await self._shutdown()
+            finally:
+                # Never leave the strip lit if shutdown itself fails.
+                self.led.stop()
         return 0
 
     def _install_signal_handlers(self) -> None:
@@ -152,6 +158,7 @@ class ApplicationOrchestrator:
         self._shutdown_event.set()
 
     async def _startup(self) -> None:
+        self.led.start()
         self._transition(AppState.INITIALIZING)
         if self._debug_viewer is not None:
             self._debug_viewer.start()
@@ -900,6 +907,7 @@ class ApplicationOrchestrator:
             self._transaction.mark_failed(detail)
         self.health.record_failure(detail)
         self._cleanup_transaction_files()
+        self.led.flash_failure()
         dest = (
             AppState.WAITING_FOR_REMOVAL
             if self._resume_state == AppState.WAITING_FOR_REMOVAL
@@ -1010,6 +1018,7 @@ class ApplicationOrchestrator:
         if target == AppState.IDLE and not ready:
             message_state = AppState.ERROR if not self.health.storage.healthy else target
 
+        self.led.set_state(message_state)
         self.status.update(
             message_state,
             capture_id=self._transaction.capture_id if self._transaction else None,
@@ -1104,6 +1113,7 @@ class ApplicationOrchestrator:
         self._clear_transaction()
         if self._debug_viewer is not None:
             self._debug_viewer.stop()
+        await asyncio.to_thread(self.led.stop)
         await self.api.stop()
         await asyncio.to_thread(self.camera.shutdown)
         logger.info("Shutdown complete")
